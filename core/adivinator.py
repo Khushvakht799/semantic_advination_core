@@ -1,374 +1,284 @@
-from typing import List, Dict, Any, Optional
-from .models import *
-from storage.trie_storage import CommandTrie
+# core\adivinator.py
+"""
+Ядро семантического предсказания команд — Adivinator.
+Минимальный, эффективный, расширяемый.
+"""
+
+from typing import List, Dict, Tuple, Optional, Any
+from dataclasses import dataclass, field
+import heapq
+
+
+@dataclass
+class Suggestion:
+    """Предложение команды с оценкой."""
+    command_name: str
+    confidence: float  # 0.0 - 1.0
+    matched_tokens: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __lt__(self, other: 'Suggestion') -> bool:
+        """Для сортировки в куче (max-heap по confidence)."""
+        return self.confidence > other.confidence  # обратно для max-heap
+
+
+class TrieNode:
+    """Узел префиксного дерева для хранения команд."""
+    
+    __slots__ = ('children', 'command_names', 'is_terminal')
+    
+    def __init__(self):
+        self.children: Dict[str, 'TrieNode'] = {}
+        self.command_names: List[str] = []  # команды, заканчивающиеся в этом узле
+        self.is_terminal: bool = False
 
 
 class Adivinator:
     """
-    Чистая адивинация.
-    Только угадывает варианты команд по префиксу.
-    Не принимает решений о семантике или допустимости.
+    Ядро предсказания команд на основе префиксного дерева.
     """
     
-    def __init__(self, storage: CommandTrie, config: Dict[str, Any] = None):
-        self.storage = storage
-        self.config = config or {
-            "min_prefix_length": 2,
-            "partial_threshold": 0.3,
-            "max_exact_results": 5,
-            "max_partial_results": 3,
-            "enable_fallback": True
-        }
+    def __init__(self):
+        self.trie_root = TrieNode()
+        self.commands: Dict[str, List[str]] = {}  # name -> tokens
+        self._build_cache: Dict[str, List[Suggestion]] = {}
     
-    def advinate(self, prefix: str, context: Dict[str, Any] = None) -> AdvinationResult:
+    def add_command(self, name: str, tokens: List[str]) -> None:
         """
-        Основной метод адивинации.
-        Возвращает только факты о найденных вариантах.
+        Добавляет команду в Trie.
         """
-        context = context or {}
+        self.commands[name] = tokens.copy()
         
-        # 1. Проверка минимальной длины префикса
-        if len(prefix) < self.config["min_prefix_length"]:
-            return AdvinationResult(
-                result_type=AdvinationResultType.NO_MATCH,
-                raw_prefix=prefix,
-                raw_context=context
-            )
+        # Вставляем каждый токен в Trie
+        node = self.trie_root
+        for token in tokens:
+            if token not in node.children:
+                node.children[token] = TrieNode()
+            node = node.children[token]
         
-        # 2. Поиск точных совпадений
-        exact_matches = self.storage.search_exact(
-            prefix,
-            limit=self.config["max_exact_results"]
-        )
+        node.is_terminal = True
+        node.command_names.append(name)
         
-        if exact_matches:
-            suggestions = [
-                CommandSuggestion(
-                    text=match["command"],
-                    source="exact_match",
-                    match_score=1.0,
-                    metadata={
-                        "usage_count": match.get("usage_count", 0),
-                        "storage_score": match.get("score", 1.0),
-                        "command_id": match.get("id")
-                    }
-                )
-                for match in exact_matches
-            ]
-            
-            return AdvinationResult(
-                result_type=AdvinationResultType.FOUND,
-                suggestions=suggestions,
-                confidence=1.0,
-                raw_prefix=prefix,
-                raw_context=context
-            )
-        
-        # 3. Поиск похожих команд (если префикс достаточно длинный)
-        if len(prefix) >= 3:
-            similar_matches = self.storage.search_similar(
-                prefix,
-                threshold=self.config["partial_threshold"],
-                limit=self.config["max_partial_results"]
-            )
-            
-            if similar_matches:
-                suggestions = []
-                for match in similar_matches:
-                    suggestions.append(
-                        CommandSuggestion(
-                            text=match["command"],
-                            source="partial_match",
-                            match_score=match.get("similarity", 0.5),
-                            metadata={
-                                "similarity": match.get("similarity", 0),
-                                "distance": match.get("distance", 0),
-                                "usage_count": match.get("usage_count", 0),
-                                "command_id": match.get("id")
-                            }
-                        )
-                    )
-                
-                # Confidence - максимальное значение похожести
-                max_similarity = max(match.get("similarity", 0) for match in similar_matches)
-                
-                return AdvinationResult(
-                    result_type=AdvinationResultType.PARTIAL_FOUND,
-                    suggestions=suggestions,
-                    confidence=max_similarity,
-                    raw_prefix=prefix,
-                    raw_context=context
-                )
-        
-        # 4. Fallback-варианты (если включены)
-        if self.config["enable_fallback"]:
-            fallback_suggestions = self._get_fallback_suggestions(prefix, context)
-            if fallback_suggestions:
-                return AdvinationResult(
-                    result_type=AdvinationResultType.PARTIAL_FOUND,
-                    suggestions=fallback_suggestions,
-                    confidence=0.1,  # Низкая уверенность для fallback
-                    raw_prefix=prefix,
-                    raw_context=context
-                )
-        
-        # 5. Ничего не найдено
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            raw_prefix=prefix,
-            raw_context=context
-        )
+        # Сбрасываем кэш при изменениях
+        self._build_cache.clear()
     
-    def learn(self, command_text: str, context: Dict[str, Any] = None):
+    def _exact_match(self, tokens: List[str]) -> Optional[str]:
         """
-        Обучение на лету: добавление новой команды в хранилище.
+        Ищет точное совпадение команды.
+        Возвращает имя команды или None.
         """
-        command_data = {
-            "command": command_text,
-            "context": context or {},
-            "usage_count": 1,
-            "learned_at": datetime.now().isoformat()
-        }
+        node = self.trie_root
+        for token in tokens:
+            if token not in node.children:
+                return None
+            node = node.children[token]
         
-        # Извлекаем метаданные из контекста, если есть
-        if context:
-            if "category" in context:
-                command_data["category"] = context["category"]
-            if "tags" in context:
-                command_data["tags"] = context["tags"]
-            if "description" in context:
-                command_data["description"] = context["description"]
-        
-        self.storage.insert(command_data)
+        return node.command_names[0] if node.command_names else None
     
-    def batch_learn(self, commands: List[Dict[str, Any]]):
+    def _partial_match(self, tokens: List[str], max_suggestions: int = 5) -> List[Suggestion]:
         """
-        Пакетное обучение: добавление нескольких команд.
+        Ищет частичные совпадения команд.
+        Возвращает ранжированный список предложений.
         """
-        for cmd in commands:
-            self.learn(cmd.get("command", ""), cmd.get("context", {}))
-    
-    def update_usage(self, command_text: str, increment: int = 1) -> bool:
-        """
-        Обновляет счетчик использования команды.
-        """
-        # Ищем команду по тексту
-        matches = self.storage.search_exact(command_text, limit=1)
-        if matches:
-            command_id = matches[0].get("id")
-            if command_id:
-                return self.storage.update_usage(command_id, increment)
-        return False
-    
-    def get_command_stats(self, command_text: str) -> Optional[Dict[str, Any]]:
-        """
-        Возвращает статистику команды.
-        """
-        matches = self.storage.search_exact(command_text, limit=1)
-        if matches:
-            return {
-                "command": matches[0].get("command"),
-                "usage_count": matches[0].get("usage_count", 0),
-                "score": matches[0].get("score", 0),
-                "created_at": matches[0].get("created_at")
-            }
-        return None
-    
-    def _get_fallback_suggestions(self, prefix: str, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """
-        Возвращает fallback-варианты для очень общих префиксов.
-        """
-        fallbacks = []
+        if not tokens:
+            return []
         
-        # Простые эвристики для распространенных команд
-        if len(prefix) <= 2:
-            # Для очень коротких префиксов
-            common_commands = [
-                "ls", "cd", "pwd", "mkdir", "rm", "cp", "mv",
-                "git status", "git add", "git commit",
-                "python", "pip install", "docker ps"
-            ]
-            
-            for cmd in common_commands:
-                if cmd.startswith(prefix):
-                    fallbacks.append(
-                        CommandSuggestion(
-                            text=cmd,
-                            source="fallback",
-                            match_score=0.1,
-                            metadata={"type": "common_command"}
-                        )
-                    )
+        # Кэшируем результаты для часто используемых запросов
+        cache_key = '_'.join(tokens)
+        if cache_key in self._build_cache:
+            return self._build_cache[cache_key][:max_suggestions]
         
-        # Контекстно-зависимые fallback
-        elif context.get("domain") == "git":
-            git_commands = ["git add", "git commit", "git push", "git pull", "git status"]
-            for cmd in git_commands:
-                if cmd.startswith(prefix):
-                    fallbacks.append(
-                        CommandSuggestion(
-                            text=cmd,
-                            source="fallback",
-                            match_score=0.15,
-                            metadata={"domain": "git"}
-                        )
-                    )
+        suggestions = []
         
-        elif context.get("domain") == "docker":
-            docker_commands = ["docker ps", "docker build", "docker run", "docker logs"]
-            for cmd in docker_commands:
-                if cmd.startswith(prefix):
-                    fallbacks.append(
-                        CommandSuggestion(
-                            text=cmd,
-                            source="fallback",
-                            match_score=0.15,
-                            metadata={"domain": "docker"}
-                        )
-                    )
-        
-        return fallbacks[:self.config["max_exact_results"]]
-    
-    def search_with_filters(self,
-                           prefix: str,
-                           filters: Dict[str, Any] = None,
-                           context: Dict[str, Any] = None) -> AdvinationResult:
-        """
-        Поиск с дополнительными фильтрами.
-        """
-        # Базовый поиск
-        result = self.advinate(prefix, context)
-        
-        if not result.suggestions or not filters:
-            return result
-        
-        filtered_suggestions = []
-        
-        for suggestion in result.suggestions:
-            include = True
-            
-            # Фильтр по минимальному match_score
-            if "min_score" in filters:
-                if suggestion.match_score < filters["min_score"]:
-                    include = False
-            
-            # Фильтр по source
-            if "sources" in filters:
-                if suggestion.source not in filters["sources"]:
-                    include = False
-            
-            # Фильтр по метаданным
-            if "metadata_filters" in filters:
-                for key, value in filters["metadata_filters"].items():
-                    if suggestion.metadata.get(key) != value:
-                        include = False
-                        break
-            
-            if include:
-                filtered_suggestions.append(suggestion)
-        
-        # Обновляем результат с отфильтрованными предложениями
-        if filtered_suggestions:
-            result.suggestions = filtered_suggestions
-            # Корректируем confidence на основе отфильтрованных результатов
-            if filtered_suggestions:
-                max_score = max(s.match_score for s in filtered_suggestions)
-                result.confidence = max_score
+        # Ищем команды, начинающиеся с данных токенов
+        node = self.trie_root
+        for i, token in enumerate(tokens):
+            if token not in node.children:
+                # Если токен не найден, предлагаем команды из текущего узла
+                self._collect_suggestions(node, tokens[:i], suggestions)
+                break
+            node = node.children[token]
         else:
-            result.result_type = AdvinationResultType.NO_MATCH
-            result.suggestions = None
+            # Все токены найдены — собираем команды из этого узла и его детей
+            self._collect_suggestions(node, tokens, suggestions, exact=True)
+        
+        # Ранжируем по количеству совпавших токенов
+        ranked = self._rank_suggestions(tokens, suggestions)
+        
+        # Ограничиваем количество и кэшируем
+        result = ranked[:max_suggestions]
+        self._build_cache[cache_key] = ranked
         
         return result
     
-    def get_storage_stats(self) -> Dict[str, Any]:
+    def _collect_suggestions(self, 
+                            node: TrieNode, 
+                            matched_tokens: List[str],
+                            suggestions: List[Suggestion],
+                            exact: bool = False) -> None:
         """
-        Возвращает статистику хранилища.
+        Собирает предложения из узла и его поддерева.
         """
-        return self.storage.get_stats()
-
-
-class ConfigurableAdivinator(Adivinator):
-    """
-    Расширенный адивинатор с дополнительными возможностями конфигурации.
-    """
-    
-    def __init__(self, storage: CommandTrie, config: Dict[str, Any] = None):
-        super().__init__(storage, config)
-        
-        # Дополнительные конфигурации
-        self.advanced_config = {
-            "enable_semantic_expansion": config.get("enable_semantic_expansion", False),
-            "expansion_threshold": config.get("expansion_threshold", 0.7),
-            "max_expansion_results": config.get("max_expansion_results", 2),
-            "context_boost_factor": config.get("context_boost_factor", 0.3)
-        }
-        
-        # Загруженные семантические модели (заглушка)
-        self.semantic_models = {}
-    
-    def advinate_with_expansion(self, prefix: str, context: Dict[str, Any] = None) -> AdvinationResult:
-        """
-        Адивинация с семантическим расширением.
-        """
-        # Базовый поиск
-        base_result = super().advinate(prefix, context)
-        
-        if not self.advanced_config["enable_semantic_expansion"]:
-            return base_result
-        
-        # Если есть точные совпадения, расширяем их
-        if base_result.result_type == AdvinationResultType.FOUND:
-            expanded = self._expand_suggestions(base_result.suggestions, context)
-            if expanded:
-                # Объединяем и сортируем
-                all_suggestions = base_result.suggestions + expanded
-                all_suggestions.sort(key=lambda x: x.match_score, reverse=True)
-                
-                return AdvinationResult(
-                    result_type=AdvinationResultType.FOUND,
-                    suggestions=all_suggestions[:self.config["max_exact_results"]],
-                    confidence=base_result.confidence,
-                    raw_prefix=prefix,
-                    raw_context=context
+        if node.is_terminal:
+            for cmd_name in node.command_names:
+                confidence = 1.0 if exact else len(matched_tokens) / len(self.commands[cmd_name])
+                suggestions.append(
+                    Suggestion(
+                        command_name=cmd_name,
+                        confidence=confidence,
+                        matched_tokens=matched_tokens.copy(),
+                        metadata={'match_type': 'exact' if exact else 'partial'}
+                    )
                 )
         
-        return base_result
+        # Рекурсивно обходим детей
+        for token, child_node in node.children.items():
+            self._collect_suggestions(child_node, matched_tokens + [token], suggestions)
     
-    def _expand_suggestions(self,
-                           suggestions: List[CommandSuggestion],
-                           context: Dict[str, Any]) -> List[CommandSuggestion]:
+    def _rank_suggestions(self, query_tokens: List[str], 
+                         suggestions: List[Suggestion]) -> List[Suggestion]:
         """
-        Расширяет список предложений семантически похожими командами.
+        Ранжирует предложения по релевантности.
         """
-        expanded = []
+        if not suggestions:
+            return []
         
-        for suggestion in suggestions:
-            # Ищем семантически похожие команды
-            similar_commands = self.storage.search_similar(
-                suggestion.text,
-                threshold=self.advanced_config["expansion_threshold"],
-                limit=self.advanced_config["max_expansion_results"]
-            )
+        scored = []
+        for sug in suggestions:
+            cmd_tokens = self.commands[sug.command_name]
             
-            for similar in similar_commands:
-                # Проверяем, что эта команда еще не в предложениях
-                if similar["command"] not in [s.text for s in suggestions]:
-                    # Учитываем контекст
-                    context_boost = 0.0
-                    if context.get("domain") and context["domain"] in similar.get("category", ""):
-                        context_boost = self.advanced_config["context_boost_factor"]
-                    
-                    expanded.append(
-                        CommandSuggestion(
-                            text=similar["command"],
-                            source="semantic_expansion",
-                            match_score=similar.get("similarity", 0.5) * (1 + context_boost),
-                            metadata={
-                                "original_suggestion": suggestion.text,
-                                "expansion_similarity": similar.get("similarity", 0),
-                                **similar.get("metadata", {})
-                            }
-                        )
-                    )
+            # Базовый score — совпадение префикса
+            score = sug.confidence
+            
+            # Бонус за полное совпадение длины
+            if len(cmd_tokens) == len(query_tokens):
+                score *= 1.2
+            
+            # Бонус за короткие команды (менее 3 токенов)
+            if len(cmd_tokens) <= 2:
+                score *= 1.1
+            
+            scored.append((score, sug))
         
-        return expanded
+        # Сортируем по убыванию score
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Обновляем confidence в предложениях
+        result = []
+        max_score = scored[0][0] if scored else 1.0
+        
+        for score, sug in scored:
+            normalized_score = score / max_score if max_score > 0 else score
+            sug.confidence = min(1.0, normalized_score)  # обрезаем до 1.0
+            result.append(sug)
+        
+        return result
+    
+    def suggest(self, 
+               input_text: str, 
+               max_suggestions: int = 5) -> List[Suggestion]:
+        """
+        Основной метод: принимает текст, возвращает предложения команд.
+        """
+        # Простая токенизация (можно заменить на utils/tokenizer.py)
+        tokens = [t.lower().strip() for t in input_text.split() if t.strip()]
+        
+        if not tokens:
+            return []
+        
+        # Сначала проверяем точное совпадение
+        exact_name = self._exact_match(tokens)
+        if exact_name:
+            return [Suggestion(
+                command_name=exact_name,
+                confidence=1.0,
+                matched_tokens=tokens.copy(),
+                metadata={'match_type': 'exact'}
+            )]
+        
+        # Если нет точного — ищем частичные
+        return self._partial_match(tokens, max_suggestions)
+    
+    def batch_suggest(self, 
+                     inputs: List[str], 
+                     max_suggestions: int = 3) -> Dict[str, List[Suggestion]]:
+        """
+        Пакетное предсказание для нескольких входов.
+        """
+        return {text: self.suggest(text, max_suggestions) for text in inputs}
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Возвращает статистику по Adivinator.
+        """
+        def count_nodes(node: TrieNode) -> int:
+            count = 1
+            for child in node.children.values():
+                count += count_nodes(child)
+            return count
+        
+        total_nodes = count_nodes(self.trie_root) - 1  # без корня
+        
+        return {
+            'total_commands': len(self.commands),
+            'total_trie_nodes': total_nodes,
+            'avg_tokens_per_command': sum(len(t) for t in self.commands.values()) / len(self.commands) if self.commands else 0,
+            'cache_size': len(self._build_cache)
+        }
+
+
+# Фабричная функция для удобного создания
+def create_adivinator(commands: Dict[str, List[str]] = None) -> Adivinator:
+    """
+    Создает и наполняет Adivinator командами.
+    """
+    adv = Adivinator()
+    if commands:
+        for name, tokens in commands.items():
+            adv.add_command(name, tokens)
+    return adv
+
+
+# Пример использования
+if __name__ == "__main__":
+    # Тестовые команды
+    test_commands = {
+        "create_project": ["create", "project"],
+        "create_file": ["create", "file"],
+        "delete_project": ["delete", "project"],
+        "start_server": ["start", "server"],
+        "stop_server": ["stop", "server"],
+        "show_logs": ["show", "logs"],
+        "show_status": ["show", "status"],
+        "help": ["help"],
+        "list": ["list"],
+    }
+    
+    # Создаем и наполняем Adivinator
+    adv = create_adivinator(test_commands)
+    
+    # Тестируем
+    test_inputs = [
+        "create",
+        "create proj",
+        "show",
+        "start",
+        "unknown command",
+        "",
+    ]
+    
+    print("🔮 Adivinator Demo")
+    print("=" * 50)
+    
+    for inp in test_inputs:
+        suggestions = adv.suggest(inp, max_suggestions=3)
+        print(f"\nInput: '{inp}'")
+        if suggestions:
+            for i, sug in enumerate(suggestions, 1):
+                print(f"  {i}. {sug.command_name} ({sug.confidence:.2f}) - {sug.metadata['match_type']}")
+        else:
+            print("  (no suggestions)")
+    
+    # Статистика
+    stats = adv.get_stats()
+    print(f"\n📊 Stats: {stats}")

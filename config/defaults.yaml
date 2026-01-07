@@ -1,0 +1,100 @@
+# config\defaults.yaml
+# Конфигурационные значения по умолчанию для semantic_advination_core
+
+# Настройки токенизатора
+tokenizer:
+  stop_words: ["the", "a", "an", "and", "or", "in", "on", "at", "to", "for"]
+  preserve_case: false
+  split_on_punctuation: true
+
+# Настройки схожести
+similarity:
+  weights:
+    cosine: 0.4
+    levenshtein: 0.4
+    jaccard: 0.2
+  threshold: 0.5  # минимальная схожесть для совпадения
+
+# Настройки базы данных команд
+database:
+  path: "data/commands.db"
+  backup_on_start: true
+  auto_vacuum: true
+
+# Настройки хранилища Trie
+trie_storage:
+  max_suggestions: 10
+  cache_size: 1000
+
+# Настройки выполнения команд
+execution:
+  timeout_seconds: 30
+  max_retries: 3
+  retry_delay_ms: 1000
+
+# Настройки логирования
+logging:
+  level: "INFO"
+  file: "logs/semantic_advination.log"
+  max_size_mb: 10
+  backup_count: 5
+
+# Настройки отложенных задач
+deferred:
+  max_queue_size: 1000
+  poll_interval_seconds: 5
+  retry_policy: "exponential_backoff"
+
+# Настройки адаптеров
+adapters:
+  shell:
+    prompt: "advination> "
+    history_file: "data/shell_history.txt"
+    max_history: 1000
+  api:
+    host: "localhost"
+    port: 8000
+    workers: 4
+    cors_origins: ["*"]
+
+# Настройки безопасности
+security:
+  allowed_users: ["*"]
+  require_auth: false
+  api_key_header: "X-API-Key"
+
+# Настройки мониторинга
+monitoring:
+  enable_metrics: true
+  metrics_port: 9090
+  health_check_path: "/health"
+
+# Примеры команд по умолчанию
+default_commands:
+  - name: "help"
+    tokens: ["help"]
+    description: "Показывает справку по командам"
+    action_type: "builtin"
+    action_data: {"handler": "show_help"}
+    category: "system"
+  
+  - name: "list_commands"
+    tokens: ["list", "commands"]
+    description: "Список всех доступных команд"
+    action_type: "builtin"
+    action_data: {"handler": "list_commands"}
+    category: "system"
+  
+  - name: "create_project"
+    tokens: ["create", "project"]
+    description: "Создает новый проект"
+    action_type: "shell"
+    action_data: {"command": "mkdir {project_name}"}
+    category: "project_management"
+  
+  - name: "show_stats"
+    tokens: ["show", "statistics"]
+    description: "Показывает статистику системы"
+    action_type: "builtin"
+    action_data: {"handler": "show_statistics"}
+    category: "system"
