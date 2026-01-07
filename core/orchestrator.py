@@ -1,359 +1,679 @@
-from typing import Dict, Any, Optional
-import time
-from datetime import datetime, timedelta
+# core/orchestrator.py
+"""
+Модуль-оркестратор для координации работы Adivinator и Validator.
+Управляет workflow семантического предсказания команд.
+"""
+
+from typing import List, Dict, Any, Optional, Tuple, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+import logging
+from datetime import datetime
 import uuid
 
-from .models import *
-from .adivinator import Adivinator
-from .validator import CommandValidator
-from .composer import CommandComposer
+from core.adivinator import Adivinator, AdvinationResult, Suggestion, AdvinationResultType
+from core.validator import Validator, ValidationResult, Context
 
 
-class DeferralStrategy:
-    """Стратегия откладывания задач"""
-    
-    def __init__(self, config: Dict[str, Any] = None):
-        self.config = config or {
-            "base_delay_hours": 24,
-            "max_retries": 3,
-            "exponential_backoff": True,
-            "priority_delays": {1: 1.0, 2: 0.5, 3: 0.25}  # множители задержки
-        }
-    
-    def calculate_retry_time(self, attempt: int, priority: int = 1) -> Optional[datetime]:
-        """Рассчитывает время следующей попытки"""
-        if attempt >= self.config["max_retries"]:
-            return None
-        
-        if self.config["exponential_backoff"]:
-            delay_hours = self.config["base_delay_hours"] * (2 ** attempt)
-        else:
-            delay_hours = self.config["base_delay_hours"]
-        
-        # Корректируем по приоритету
-        priority_factor = self.config["priority_delays"].get(priority, 1.0)
-        delay_hours *= priority_factor
-        
-        return datetime.now() + timedelta(hours=delay_hours)
+class OrchestrationOutcome(Enum):
+    """Результаты оркестрации"""
+    SUGGEST_EXACT = "suggest_exact"            # Точные предложения
+    SUGGEST_ADAPTED = "suggest_adapted"        # Адаптированные предложения
+    SUGGEST_FALLBACK = "suggest_fallback"      # Резервные предложения
+    START_DIALOG = "start_dialog"              # Начать диалог
+    DEFER = "defer"                            # Отложить решение
+    ERROR = "error"                            # Ошибка
+    NO_ACTION = "no_action"                    # Бездействие
+    RETRY = "retry"                            # Повторить
+    MULTIPLE_OPTIONS = "multiple_options"      # Несколько вариантов
+    CONFIRMATION_NEEDED = "confirmation_needed"  # Требуется подтверждение
 
 
-class OrchestrationMetrics:
-    """Метрики оркестрации"""
+class DialogState(Enum):
+    """Состояния диалога"""
+    INITIAL = "initial"
+    CLARIFYING = "clarifying"
+    CONFIRMING = "confirming"
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+
+
+@dataclass
+class DialogStep:
+    """Шаг диалога"""
+    step_id: str
+    message: str
+    options: List[str] = field(default_factory=list)
+    user_response: Optional[str] = None
+    timestamp: datetime = field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OrchestrationResult:
+    """Результат оркестрации"""
+    outcome: OrchestrationOutcome
+    suggestions: List[Suggestion] = field(default_factory=list)
+    dialog_state: DialogState = DialogState.INITIAL
+    dialog_steps: List[DialogStep] = field(default_factory=list)
+    confidence: float = 0.0
+    context_used: bool = False
+    error_message: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     
-    def __init__(self):
-        self.metrics = {
-            "requests_total": 0,
-            "advination_results": {"FOUND": 0, "PARTIAL": 0, "NO_MATCH": 0},
-            "outcomes": {},
-            "processing_times": [],
-            "errors": 0
-        }
-    
-    def record_advination(self, result_type: AdvinationResultType):
-        self.metrics["advination_results"][result_type.value] += 1
-    
-    def record_orchestration(self, outcome: OrchestrationOutcome, processing_time: float):
-        self.metrics["requests_total"] += 1
-        self.metrics["outcomes"][outcome.value] = self.metrics["outcomes"].get(outcome.value, 0) + 1
-        self.metrics["processing_times"].append(processing_time)
-    
-    def record_error(self):
-        self.metrics["errors"] += 1
-    
-    def get_summary(self) -> Dict[str, Any]:
-        """Возвращает сводку метрик"""
-        times = self.metrics["processing_times"]
-        avg_time = sum(times) / len(times) if times else 0
-        
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразование в словарь"""
         return {
-            **self.metrics,
-            "avg_processing_time": avg_time,
-            "success_rate": (self.metrics["requests_total"] - self.metrics["errors"]) / 
-                           max(self.metrics["requests_total"], 1)
+            'outcome': self.outcome.value,
+            'suggestions_count': len(self.suggestions),
+            'suggestions': [s.to_dict() for s in self.suggestions],
+            'dialog_state': self.dialog_state.value,
+            'dialog_steps_count': len(self.dialog_steps),
+            'confidence': self.confidence,
+            'context_used': self.context_used,
+            'error_message': self.error_message,
+            'metadata': self.metadata,
+            'request_id': self.request_id
         }
+    
+    def add_dialog_step(self, message: str, options: List[str] = None) -> 'DialogStep':
+        """Добавление шага диалога"""
+        step = DialogStep(
+            step_id=f"step_{len(self.dialog_steps) + 1}",
+            message=message,
+            options=options or []
+        )
+        self.dialog_steps.append(step)
+        return step
+    
+    def get_best_suggestion(self) -> Optional[Suggestion]:
+        """Получение лучшего предложения"""
+        if not self.suggestions:
+            return None
+        return max(self.suggestions, key=lambda x: x.confidence)
+    
+    def get_suggestions_by_threshold(self, threshold: float = 0.3) -> List[Suggestion]:
+        """Получение предложений с доверием выше порога"""
+        return [s for s in self.suggestions if s.confidence >= threshold]
 
 
-class ProductionOrchestrator:
-    """
-    Основной оркестратор workflow.
-    Управляет всем процессом от запроса до результата.
-    """
+@dataclass
+class OrchestrationConfig:
+    """Конфигурация оркестратора"""
+    enable_validation: bool = True
+    enable_dialog: bool = True
+    min_exact_confidence: float = 0.9
+    min_partial_confidence: float = 0.5
+    max_suggestions: int = 5
+    dialog_timeout_seconds: int = 30
+    retry_count: int = 2
+    fallback_enabled: bool = True
+    log_level: str = "INFO"
+    workflow_hooks: List[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkflowStep:
+    """Шаг workflow"""
+    name: str
+    handler: Callable
+    conditions: List[Callable] = field(default_factory=list)
+    priority: int = 0
+
+
+class Orchestrator:
+    """Оркестратор для управления workflow предсказания команд"""
     
-    def __init__(self,
-                 advinator: Adivinator = None,
-                 validator: CommandValidator = None,
-                 composer: CommandComposer = None,
-                 config: Dict[str, Any] = None):
+    def __init__(self, adivinator: Adivinator, validator: Validator, 
+                 config: Optional[OrchestrationConfig] = None):
+        """
+        Инициализация оркестратора
         
-        self.config = {
-            "enable_adaptation": True,
-            "enable_composition": True,
-            "enable_deferral": True,
-            "deferral_strategy": DeferralStrategy(),
-            **config or {}
-        }
+        Args:
+            adivinator: Экземпляр Adivinator
+            validator: Экземпляр Validator
+            config: Конфигурация оркестратора
+        """
+        self.adivinator = adivinator
+        self.validator = validator
+        self.config = config or OrchestrationConfig()
         
-        self.adivinator = advinator or Adivinator(None)
-        self.validator = validator or CommandValidator()
-        self.composer = composer or CommandComposer()
-        self.metrics = OrchestrationMetrics()
-        self.deferred_tasks: Dict[str, Dict] = {}
+        self.logger = self._setup_logger()
+        self.workflow_steps: List[WorkflowStep] = []
+        self.dialog_sessions: Dict[str, List[DialogStep]] = {}
+        
+        # Инициализация стандартного workflow
+        self._init_workflow()
+        
+        self.logger.info("Orchestrator initialized")
     
-    def process_request(self,
-                       prefix: str,
-                       context: Dict[str, Any] = None,
-                       user_id: str = None) -> OrchestrationResult:
+    def _setup_logger(self) -> logging.Logger:
+        """Настройка логгера"""
+        logger = logging.getLogger(__name__)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        
+        logger.setLevel(getattr(logging, self.config.log_level))
+        return logger
+    
+    def _init_workflow(self) -> None:
+        """Инициализация стандартного workflow"""
+        # Основные шаги workflow
+        self.add_workflow_step(
+            name="exact_match",
+            handler=self._handle_exact_match,
+            conditions=[self._condition_exact_match],
+            priority=10
+        )
+        
+        self.add_workflow_step(
+            name="confident_partial",
+            handler=self._handle_confident_partial,
+            conditions=[self._condition_confident_partial],
+            priority=20
+        )
+        
+        self.add_workflow_step(
+            name="multiple_options",
+            handler=self._handle_multiple_options,
+            conditions=[self._condition_multiple_options],
+            priority=30
+        )
+        
+        self.add_workflow_step(
+            name="start_dialog",
+            handler=self._handle_start_dialog,
+            conditions=[self._condition_needs_clarification],
+            priority=40
+        )
+        
+        self.add_workflow_step(
+            name="fallback",
+            handler=self._handle_fallback,
+            conditions=[self._condition_needs_fallback],
+            priority=50
+        )
+        
+        self.add_workflow_step(
+            name="no_match",
+            handler=self._handle_no_match,
+            conditions=[self._condition_no_match],
+            priority=60
+        )
+    
+    def add_workflow_step(self, name: str, handler: Callable, 
+                         conditions: List[Callable] = None, priority: int = 0) -> None:
         """
-        Основной метод обработки запроса.
+        Добавление шага workflow
+        
+        Args:
+            name: Название шага
+            handler: Обработчик шага
+            conditions: Условия выполнения
+            priority: Приоритет (меньше = выше приоритет)
         """
-        start_time = time.time()
-        context = context or {}
+        step = WorkflowStep(
+            name=name,
+            handler=handler,
+            conditions=conditions or [],
+            priority=priority
+        )
+        self.workflow_steps.append(step)
+        self.workflow_steps.sort(key=lambda x: x.priority)
+        self.logger.info(f"Added workflow step: {name} (priority: {priority})")
+    
+    def process(self, prefix: str, context: Optional[Context] = None) -> OrchestrationResult:
+        """
+        Основной метод обработки запроса
+        
+        Args:
+            prefix: Входной префикс/запрос
+            context: Контекст выполнения
+            
+        Returns:
+            Результат оркестрации
+        """
+        request_id = str(uuid.uuid4())
+        self.logger.info(f"[{request_id}] Processing request: '{prefix}'")
         
         try:
-            # 1. Чистая адивинация
-            adv_result = self.adivinator.advinate(prefix, context)
-            self.metrics.record_advination(adv_result.result_type)
+            # 1. Получаем предсказания
+            adv_result = self.adivinator.advinate(prefix)
+            self.logger.debug(f"[{request_id}] Advination result: {adv_result.result_type}")
             
-            # 2. Обработка результатов адивинации
-            if adv_result.result_type == AdvinationResultType.FOUND:
-                result = self._handle_found(adv_result, context)
-            elif adv_result.result_type == AdvinationResultType.PARTIAL_FOUND:
-                result = self._handle_partial(adv_result, context)
-            else:  # NO_MATCH
-                result = self._handle_no_match(prefix, context)
+            # 2. Создаем базовый результат
+            result = OrchestrationResult(
+                outcome=OrchestrationOutcome.NO_ACTION,
+                confidence=adv_result.confidence,
+                request_id=request_id,
+                metadata={
+                    'original_query': prefix,
+                    'advination_type': adv_result.result_type.value
+                }
+            )
             
-            # 3. Записываем метрики
-            elapsed = time.time() - start_time
-            self.metrics.record_orchestration(result.outcome, elapsed)
+            # 3. Выполняем workflow
+            for workflow_step in self.workflow_steps:
+                if self._check_conditions(workflow_step, adv_result, context):
+                    self.logger.debug(f"[{request_id}] Executing workflow step: {workflow_step.name}")
+                    
+                    step_result = workflow_step.handler(adv_result, context, result)
+                    if step_result:
+                        result = step_result
+                        break
             
-            # 4. Добавляем метаданные
-            result.metadata.update({
-                "processing_time_ms": elapsed * 1000,
-                "user_id": user_id,
-                "timestamp": datetime.now().isoformat()
-            })
+            # 4. Добавляем контекстную информацию
+            if context:
+                result.context_used = True
+                result.metadata['context'] = context.to_dict()
+            
+            # 5. Логируем результат
+            self.logger.info(
+                f"[{request_id}] Orchestration complete: {result.outcome.value}, "
+                f"confidence: {result.confidence:.2f}, "
+                f"suggestions: {len(result.suggestions)}"
+            )
             
             return result
             
         except Exception as e:
-            self.metrics.record_error()
-            
-            # При ошибке - откладываем
-            if self.config["enable_deferral"]:
-                task_id = self._defer_task(
-                    prefix, context,
-                    f"Ошибка обработки: {str(e)}",
-                    priority=3
-                )
-                return OrchestrationResult(
-                    outcome=OrchestrationOutcome.DEFER,
-                    task_id=task_id,
-                    reason="Внутренняя ошибка системы",
-                    retry_after=datetime.now() + timedelta(hours=1),
-                    priority=3,
-                    metadata={"error": str(e)}
-                )
-            else:
-                # Если откладывание отключено, возвращаем ошибку
-                return OrchestrationResult(
-                    outcome=OrchestrationOutcome.DEFER,
-                    reason=f"Ошибка: {str(e)}",
-                    metadata={"error": str(e), "deferral_disabled": True}
-                )
+            self.logger.error(f"[{request_id}] Orchestration error: {e}")
+            return OrchestrationResult(
+                outcome=OrchestrationOutcome.ERROR,
+                error_message=str(e),
+                request_id=request_id,
+                metadata={'error_type': type(e).__name__}
+            )
     
-    def _handle_found(self, adv_result: AdvinationResult, context: Dict) -> OrchestrationResult:
-        """Обработка точных совпадений"""
+    def _check_conditions(self, workflow_step: WorkflowStep, 
+                         adv_result: AdvinationResult, 
+                         context: Optional[Context]) -> bool:
+        """
+        Проверка условий выполнения шага workflow
+        
+        Args:
+            workflow_step: Шаг workflow
+            adv_result: Результат предсказания
+            context: Контекст
+            
+        Returns:
+            True если все условия выполнены
+        """
+        if not workflow_step.conditions:
+            return True
+        
+        for condition in workflow_step.conditions:
+            try:
+                if not condition(adv_result, context, self):
+                    return False
+            except Exception as e:
+                self.logger.error(f"Condition check error: {e}")
+                return False
+        
+        return True
+    
+    # Условия workflow
+    def _condition_exact_match(self, adv_result: AdvinationResult, 
+                             context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: точное совпадение"""
+        return adv_result.result_type == AdvinationResultType.FOUND
+    
+    def _condition_confident_partial(self, adv_result: AdvinationResult, 
+                                   context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: уверенное частичное совпадение"""
+        if adv_result.result_type != AdvinationResultType.PARTIAL_FOUND:
+            return False
+        
+        if not self.config.enable_validation:
+            return adv_result.confidence >= self.config.min_partial_confidence
+        
+        return self.validator.is_confident(adv_result, self.config.min_partial_confidence)
+    
+    def _condition_multiple_options(self, adv_result: AdvinationResult, 
+                                  context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: несколько вариантов с похожей уверенностью"""
+        if adv_result.result_type != AdvinationResultType.PARTIAL_FOUND:
+            return False
+        
+        if len(adv_result.suggestions) < 2:
+            return False
+        
+        # Проверяем, есть ли несколько вариантов с близкой уверенностью
+        confidences = [s.confidence for s in adv_result.suggestions[:3]]
+        if len(confidences) >= 2:
+            diff = max(confidences) - min(confidences)
+            return diff < 0.2  # Разница менее 20%
+        
+        return False
+    
+    def _condition_needs_clarification(self, adv_result: AdvinationResult, 
+                                     context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: требуется уточнение"""
+        if adv_result.result_type != AdvinationResultType.PARTIAL_FOUND:
+            return False
+        
+        if not self.config.enable_dialog:
+            return False
+        
+        # Проверяем, достаточно ли уверенности для диалога
+        if adv_result.confidence < 0.3:
+            return False
+        
+        return True
+    
+    def _condition_needs_fallback(self, adv_result: AdvinationResult, 
+                                context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: требуется резервный вариант"""
+        if not self.config.fallback_enabled:
+            return False
+        
+        return adv_result.result_type in [
+            AdvinationResultType.PARTIAL_FOUND,
+            AdvinationResultType.NO_MATCH
+        ]
+    
+    def _condition_no_match(self, adv_result: AdvinationResult, 
+                          context: Optional[Context], orchestrator: 'Orchestrator') -> bool:
+        """Условие: совпадений не найдено"""
+        return adv_result.result_type == AdvinationResultType.NO_MATCH
+    
+    # Обработчики workflow
+    def _handle_exact_match(self, adv_result: AdvinationResult, 
+                          context: Optional[Context], 
+                          current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: точное совпадение"""
+        suggestions = adv_result.suggestions
+        
+        if self.config.enable_validation and context:
+            validation_result = self.validator.validate(adv_result, context)
+            if validation_result.is_valid:
+                suggestions = validation_result.suggestions
+        
+        # Ограничиваем количество предложений
+        if len(suggestions) > self.config.max_suggestions:
+            suggestions = suggestions[:self.config.max_suggestions]
+        
         return OrchestrationResult(
             outcome=OrchestrationOutcome.SUGGEST_EXACT,
-            suggestions=adv_result.suggestions,
-            metadata={"source": "exact_match", "confidence": adv_result.confidence}
+            suggestions=suggestions,
+            confidence=adv_result.confidence,
+            dialog_state=DialogState.COMPLETED,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
         )
     
-    def _handle_partial(self, adv_result: AdvinationResult, context: Dict) -> OrchestrationResult:
-        """Обработка частичных совпадений"""
-        if self.config["enable_adaptation"]:
-            # Пытаемся адаптировать
-            adapted = self.validator.adapt(adv_result.suggestions, context)
+    def _handle_confident_partial(self, adv_result: AdvinationResult, 
+                                context: Optional[Context], 
+                                current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: уверенное частичное совпадение"""
+        suggestions = adv_result.suggestions
+        
+        # Адаптируем предложения
+        if context:
+            adapted = self.validator.adapt(suggestions, context)
             if adapted:
-                return OrchestrationResult(
-                    outcome=OrchestrationOutcome.SUGGEST_ADAPTED,
-                    suggestions=adapted,
-                    metadata={"source": "adapted", "original_confidence": adv_result.confidence}
-                )
+                suggestions = adapted
         
-        # Если адаптация невозможна - пробуем композицию
-        if self.config["enable_composition"]:
-            return self._try_composition(adv_result.raw_prefix, context)
-        else:
-            # Ничего не можем предложить
-            return self._defer_or_fail(adv_result.raw_prefix, context,
-                                     "Не удалось адаптировать частичные совпадения")
-    
-    def _handle_no_match(self, prefix: str, context: Dict) -> OrchestrationResult:
-        """Обработка отсутствия совпадений"""
-        if self.config["enable_composition"]:
-            return self._try_composition(prefix, context)
-        else:
-            return self._defer_or_fail(prefix, context,
-                                     "Нет совпадений и композиция отключена")
-    
-    def _try_composition(self, prefix: str, context: Dict) -> OrchestrationResult:
-        """Попытка композиции новой команды"""
-        composition_decision = self.composer.can_compose(prefix, context)
-        
-        if composition_decision["can_compose"]:
-            # Начинаем диалог композиции
-            dialog = self.composer.start_dialog(prefix, context)
-            next_question = self.composer.get_next_question(dialog.dialog_id)
-            
-            if next_question:
-                return OrchestrationResult(
-                    outcome=OrchestrationOutcome.START_DIALOG,
-                    dialog_id=dialog.dialog_id,
-                    first_question=next_question["text"],
-                    question_type="text",
-                    metadata={
-                        "template": composition_decision["template"],
-                        "reason": composition_decision["reason"]
-                    }
-                )
-        
-        # Не можем скомпоновать - откладываем
-        return self._defer_or_fail(
-            prefix, context,
-            f"Невозможно скомпоновать: {composition_decision.get('reason', 'неизвестно')}"
-        )
-    
-    def _defer_or_fail(self, prefix: str, context: Dict, reason: str) -> OrchestrationResult:
-        """Откладывает задачу или возвращает ошибку"""
-        if self.config["enable_deferral"]:
-            task_id = self._defer_task(prefix, context, reason, priority=2)
-            return OrchestrationResult(
-                outcome=OrchestrationOutcome.DEFER,
-                task_id=task_id,
-                reason=reason,
-                retry_after=datetime.now() + timedelta(hours=24),
-                priority=2
-            )
-        else:
-            # Если откладывание отключено, возвращаем пустой результат
-            return OrchestrationResult(
-                outcome=OrchestrationOutcome.DEFER,
-                reason=reason,
-                metadata={"deferral_disabled": True}
-            )
-    
-    def _defer_task(self, prefix: str, context: Dict, reason: str, priority: int = 1) -> str:
-        """Создаёт отложенную задачу"""
-        task_id = str(uuid.uuid4())
-        strategy = self.config["deferral_strategy"]
-        retry_after = strategy.calculate_retry_time(0, priority)
-        
-        task = {
-            "task_id": task_id,
-            "prefix": prefix,
-            "context": context,
-            "reason": reason,
-            "created_at": datetime.now(),
-            "retry_after": retry_after,
-            "attempt": 0,
-            "priority": priority,
-            "status": "deferred"
-        }
-        
-        self.deferred_tasks[task_id] = task
-        
-        # Здесь можно сохранять задачи в файл или БД
-        # self._save_deferred_task(task)
-        
-        return task_id
-    
-    def continue_dialog(self, dialog_id: str, answer: str) -> OrchestrationResult:
-        """Продолжение диалога композиции"""
-        try:
-            result = self.composer.process_answer(dialog_id, answer)
-            
-            if result["status"] == "completed":
-                # Команда скомпонована
-                command = self.composer.get_dialog_result(dialog_id)
-                
-                if command:
-                    # Сохраняем новую команду
-                    self.adivinator.learn(command.text, {})
-                    return OrchestrationResult(
-                        outcome=OrchestrationOutcome.SUGGEST_EXACT,
-                        suggestions=[
-                            CommandSuggestion(
-                                text=command.text,
-                                source="composed",
-                                match_score=0.9,
-                                metadata={"dialog_id": dialog_id, "composed": True}
-                            )
-                        ],
-                        metadata={"dialog_completed": True, "command_id": command.command_id}
-                    )
-                    
-            elif result["status"] == "continue":
-                # Продолжаем диалог
-                next_q = result["next_question"]
-                return OrchestrationResult(
-                    outcome=OrchestrationOutcome.START_DIALOG,
-                    dialog_id=dialog_id,
-                    first_question=next_q["text"],
-                    question_type="text",
-                    metadata={"step": next_q["step"], "total_steps": next_q["total_steps"]}
-                )
-                
-        except Exception as e:
-            return OrchestrationResult(
-                outcome=OrchestrationOutcome.DEFER,
-                reason=f"Ошибка в диалоге: {str(e)}",
-                metadata={"error": str(e), "dialog_id": dialog_id}
-            )
+        # Ограничиваем количество предложений
+        if len(suggestions) > self.config.max_suggestions:
+            suggestions = suggestions[:self.config.max_suggestions]
         
         return OrchestrationResult(
-            outcome=OrchestrationOutcome.DEFER,
-            reason="Неизвестное состояние диалога",
-            metadata={"dialog_id": dialog_id}
+            outcome=OrchestrationOutcome.SUGGEST_ADAPTED,
+            suggestions=suggestions,
+            confidence=adv_result.confidence,
+            dialog_state=DialogState.COMPLETED,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
         )
     
-    def get_metrics(self) -> Dict[str, Any]:
-        """Возвращает текущие метрики"""
-        return self.metrics.get_summary()
-    
-    def get_deferred_tasks(self) -> List[Dict[str, Any]]:
-        """Возвращает список отложенных задач"""
-        return list(self.deferred_tasks.values())
-    
-    def retry_deferred_task(self, task_id: str) -> bool:
-        """Повторно обрабатывает отложенную задачу"""
-        if task_id not in self.deferred_tasks:
-            return False
+    def _handle_multiple_options(self, adv_result: AdvinationResult, 
+                               context: Optional[Context], 
+                               current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: несколько вариантов"""
+        suggestions = adv_result.suggestions
         
-        task = self.deferred_tasks[task_id]
-        task["attempt"] += 1
-        task["last_retry"] = datetime.now()
+        # Адаптируем предложения
+        if context:
+            adapted = self.validator.adapt(suggestions, context)
+            if adapted:
+                suggestions = adapted
         
-        try:
-            # Пытаемся обработать задачу снова
-            result = self.process_request(
-                task["prefix"],
-                task["context"],
-                task.get("user_id")
+        # Ограничиваем количество предложений
+        suggestions = suggestions[:min(3, self.config.max_suggestions)]
+        
+        result = OrchestrationResult(
+            outcome=OrchestrationOutcome.MULTIPLE_OPTIONS,
+            suggestions=suggestions,
+            confidence=adv_result.confidence,
+            dialog_state=DialogState.CLARIFYING,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
+        )
+        
+        # Добавляем шаг диалога для уточнения
+        options = [s.command_name for s in suggestions]
+        result.add_dialog_step(
+            message="Найдено несколько подходящих команд. Уточните, какую вы имели в виду?",
+            options=options
+        )
+        
+        return result
+    
+    def _handle_start_dialog(self, adv_result: AdvinationResult, 
+                           context: Optional[Context], 
+                           current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: начало диалога"""
+        result = OrchestrationResult(
+            outcome=OrchestrationOutcome.START_DIALOG,
+            suggestions=adv_result.suggestions,
+            confidence=adv_result.confidence,
+            dialog_state=DialogState.CLARIFYING,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
+        )
+        
+        # Добавляем шаг диалога
+        if adv_result.suggestions:
+            top_commands = [s.command_name for s in adv_result.suggestions[:2]]
+            result.add_dialog_step(
+                message="Уточните, что вы хотите сделать? Например: " + 
+                       ", ".join(top_commands) + " или что-то другое?",
+                options=top_commands
             )
+        else:
+            result.add_dialog_step(
+                message="Не совсем понял, что вы хотите сделать. Можете уточнить?",
+                options=[]
+            )
+        
+        return result
+    
+    def _handle_fallback(self, adv_result: AdvinationResult, 
+                       context: Optional[Context], 
+                       current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: резервный вариант"""
+        # Получаем все команды с низким доверием
+        fallback_suggestions = self.adivinator.get_all_suggestions(min_confidence=0.1)
+        
+        if context and fallback_suggestions:
+            # Адаптируем резервные предложения
+            fallback_suggestions = self.validator.adapt(fallback_suggestions, context)
+        
+        # Берем топ-N
+        fallback_suggestions = fallback_suggestions[:self.config.max_suggestions]
+        
+        return OrchestrationResult(
+            outcome=OrchestrationOutcome.SUGGEST_FALLBACK,
+            suggestions=fallback_suggestions,
+            confidence=0.1,  # Низкое доверие для резервных вариантов
+            dialog_state=DialogState.CLARIFYING,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
+        )
+    
+    def _handle_no_match(self, adv_result: AdvinationResult, 
+                       context: Optional[Context], 
+                       current_result: OrchestrationResult) -> OrchestrationResult:
+        """Обработчик: совпадений не найдено"""
+        result = OrchestrationResult(
+            outcome=OrchestrationOutcome.START_DIALOG,
+            suggestions=[],
+            confidence=0.0,
+            dialog_state=DialogState.CLARIFYING,
+            metadata=current_result.metadata,
+            request_id=current_result.request_id
+        )
+        
+        result.add_dialog_step(
+            message="Не удалось найти подходящую команду. Можете описать, что вы хотите сделать?",
+            options=[]
+        )
+        
+        return result
+    
+    def continue_dialog(self, session_id: str, user_input: str) -> OrchestrationResult:
+        """
+        Продолжение диалога
+        
+        Args:
+            session_id: ID сессии диалога
+            user_input: Ввод пользователя
             
-            if result.outcome != OrchestrationOutcome.DEFER:
-                # Задача успешно обработана
-                task["status"] = "resolved"
-                task["resolved_at"] = datetime.now()
-                task["resolution_result"] = result.to_dict()
-                return True
-            else:
-                # Задача всё ещё не может быть обработана
-                task["status"] = "still_deferred"
-                return False
-                
-        except Exception as e:
-            task["status"] = "failed"
-            task["error"] = str(e)
-            return False
+        Returns:
+            Результат продолжения диалога
+        """
+        self.logger.info(f"[{session_id}] Continuing dialog with input: '{user_input}'")
+        
+        if session_id not in self.dialog_sessions:
+            self.dialog_sessions[session_id] = []
+        
+        # Получаем историю диалога
+        dialog_history = self.dialog_sessions[session_id]
+        
+        # Создаем контекст из истории
+        context = Context(
+            history=[step.user_response for step in dialog_history if step.user_response]
+        )
+        
+        # Обрабатываем новый ввод
+        result = self.process(user_input, context)
+        
+        # Сохраняем шаг диалога
+        if result.dialog_steps:
+            last_step = result.dialog_steps[-1]
+            last_step.user_response = user_input
+            dialog_history.append(last_step)
+        
+        # Обновляем состояние диалога
+        if result.outcome in [OrchestrationOutcome.SUGGEST_EXACT, 
+                            OrchestrationOutcome.SUGGEST_ADAPTED]:
+            result.dialog_state = DialogState.COMPLETED
+        
+        return result
+    
+    def batch_process(self, prefixes: List[str], 
+                     context: Optional[Context] = None) -> List[OrchestrationResult]:
+        """
+        Пакетная обработка запросов
+        
+        Args:
+            prefixes: Список запросов
+            context: Контекст выполнения
+            
+        Returns:
+            Список результатов оркестрации
+        """
+        self.logger.info(f"Batch processing {len(prefixes)} requests")
+        return [self.process(prefix, context) for prefix in prefixes]
+    
+    def update_config(self, **kwargs) -> None:
+        """
+        Обновление конфигурации
+        
+        Args:
+            **kwargs: Параметры конфигурации
+        """
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                self.logger.info(f"Updated config: {key} = {value}")
+    
+    def get_workflow_info(self) -> Dict[str, Any]:
+        """
+        Получение информации о workflow
+        
+        Returns:
+            Словарь с информацией
+        """
+        return {
+            'workflow_steps': [
+                {
+                    'name': step.name,
+                    'priority': step.priority,
+                    'conditions_count': len(step.conditions)
+                }
+                for step in self.workflow_steps
+            ],
+            'dialog_sessions_count': len(self.dialog_sessions),
+            'config': {
+                'enable_validation': self.config.enable_validation,
+                'enable_dialog': self.config.enable_dialog,
+                'min_exact_confidence': self.config.min_exact_confidence,
+                'min_partial_confidence': self.config.min_partial_confidence,
+                'max_suggestions': self.config.max_suggestions,
+                'fallback_enabled': self.config.fallback_enabled
+            }
+        }
+    
+    def clear_dialog_sessions(self) -> None:
+        """Очистка сессий диалога"""
+        self.dialog_sessions.clear()
+        self.logger.info("Cleared all dialog sessions")
+
+
+# Фабричные функции
+def create_orchestrator(adivinator: Optional[Adivinator] = None,
+                       validator: Optional[Validator] = None,
+                       config: Optional[OrchestrationConfig] = None) -> Orchestrator:
+    """
+    Создание экземпляра Orchestrator
+    
+    Args:
+        adivinator: Экземпляр Adivinator (если None, создается новый)
+        validator: Экземпляр Validator (если None, создается новый)
+        config: Конфигурация оркестратора
+        
+    Returns:
+        Экземпляр Orchestrator
+    """
+    from core.adivinator import create_adivinator
+    from core.validator import create_validator
+    
+    adivinator = adivinator or create_adivinator()
+    validator = validator or create_validator()
+    
+    return Orchestrator(adivinator, validator, config)
+
+
+def get_default_orchestrator() -> Orchestrator:
+    """
+    Получение глобального экземпляра Orchestrator
+    
+    Returns:
+        Глобальный экземпляр Orchestrator
+    """
+    global _default_orchestrator
+    if _default_orchestrator is None:
+        _default_orchestrator = create_orchestrator()
+    return _default_orchestrator
+
+
+# Глобальный экземпляр
+_default_orchestrator: Optional[Orchestrator] = None

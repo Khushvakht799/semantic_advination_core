@@ -1,567 +1,666 @@
-from typing import List, Dict, Any, Optional, Set
-from .models import CommandSuggestion
-import re
+# core/validator.py
+"""
+Модуль для валидации и адаптации результатов предсказания команд.
+Обеспечивает фильтрацию, ранжирование и контекстную адаптацию предложений.
+"""
+
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable
+from dataclasses import dataclass
+from enum import Enum
+import logging
+from datetime import datetime
+
+from core.adivinator import AdvinationResult, Suggestion, AdvinationResultType
 
 
-class CommandValidator:
-    """
-    Валидатор и адаптер команд.
-    Знает о семантике и допустимости команд в различных контекстах.
-    """
+class ValidationStrategy(Enum):
+    """Стратегии валидации"""
+    CONFIDENCE_ONLY = "confidence_only"          # Только по доверию
+    CONTEXT_AWARE = "context_aware"              # С учетом контекста
+    HYBRID = "hybrid"                            # Гибридная стратегия
+    ADAPTIVE = "adaptive"                        # Адаптивная стратегия
+
+
+class AdaptationMode(Enum):
+    """Режимы адаптации"""
+    FILTER = "filter"                            # Фильтрация
+    REORDER = "reorder"                          # Переупорядочивание
+    BOOST = "boost"                              # Усиление/ослабление
+    TRANSFORM = "transform"                      # Трансформация
+
+
+@dataclass
+class ValidationConfig:
+    """Конфигурация валидации"""
+    min_confidence: float = 0.5
+    min_suggestions: int = 1
+    max_suggestions: int = 10
+    strategy: ValidationStrategy = ValidationStrategy.HYBRID
+    adaptation_mode: AdaptationMode = AdaptationMode.FILTER
+    use_context: bool = True
+    require_exact_match: bool = False
+    enable_logging: bool = True
+    fallback_to_partial: bool = True
+    context_weights: Optional[Dict[str, float]] = None
     
-    def __init__(self, config: Dict[str, Any] = None):
-        self.config = config or {
-            "enable_adaptation": True,
-            "known_tokens": {
-                "shell": {"ls", "cd", "pwd", "mkdir", "rm", "cp", "mv", "find", "grep", "cat"},
-                "git": {"git", "commit", "push", "pull", "clone", "branch", "merge", "status"},
-                "docker": {"docker", "ps", "build", "run", "exec", "logs", "images"},
-                "python": {"python", "pip", "install", "run", "test", "import"},
-                "system": {"sudo", "apt", "yum", "systemctl", "service"}
-            },
-            "min_confidence_for_adaptation": 0.5,
-            "adaptation_rules": {
-                "path_substitution": True,
-                "parameter_filling": True,
-                "context_aware_expansion": True
-            },
-            "validation_rules": {
-                "check_syntax": True,
-                "check_permissions": False,
-                "check_parameters": True,
-                "warn_destructive": True
-            },
-            "domain_specific_rules": {
-                "git": {
-                    "required_params": ["message", "branch"],
-                    "common_flags": ["-m", "-a", "-v"]
-                },
-                "docker": {
-                    "required_params": ["image", "container"],
-                    "common_flags": ["-it", "-d", "-p", "-v"]
-                }
+    def __post_init__(self):
+        if self.context_weights is None:
+            self.context_weights = {
+                'domain': 0.3,
+                'user_role': 0.2,
+                'environment': 0.15,
+                'history': 0.15,
+                'time': 0.1,
+                'location': 0.1
             }
+
+
+@dataclass
+class Context:
+    """Контекст выполнения"""
+    domain: Optional[str] = None
+    user_role: Optional[str] = None
+    environment: Optional[str] = None
+    history: List[str] = None
+    time: Optional[datetime] = None
+    location: Optional[str] = None
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.history is None:
+            self.history = []
+        if self.metadata is None:
+            self.metadata = {}
+        if self.time is None:
+            self.time = datetime.now()
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразование в словарь"""
+        return {
+            'domain': self.domain,
+            'user_role': self.user_role,
+            'environment': self.environment,
+            'history': self.history.copy(),
+            'time': self.time.isoformat() if self.time else None,
+            'location': self.location,
+            'metadata': self.metadata.copy()
         }
-        
-        # Кэш для хранения результатов валидации
-        self.validation_cache: Dict[str, Dict[str, Any]] = {}
-        self.adaptation_cache: Dict[str, List[CommandSuggestion]] = {}
     
-    def can_adapt(self, suggestions: List[CommandSuggestion], context: Dict[str, Any]) -> bool:
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Context':
+        """Создание из словаря"""
+        time_str = data.get('time')
+        time = datetime.fromisoformat(time_str) if time_str else None
+        
+        return cls(
+            domain=data.get('domain'),
+            user_role=data.get('user_role'),
+            environment=data.get('environment'),
+            history=data.get('history', []),
+            time=time,
+            location=data.get('location'),
+            metadata=data.get('metadata', {})
+        )
+
+
+@dataclass
+class ValidationResult:
+    """Результат валидации"""
+    is_valid: bool
+    confidence: float
+    suggestions: List[Suggestion]
+    filtered_count: int
+    validation_strategy: ValidationStrategy
+    adaptation_mode: AdaptationMode
+    context_used: bool
+    error_message: Optional[str] = None
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразование в словарь"""
+        return {
+            'is_valid': self.is_valid,
+            'confidence': self.confidence,
+            'suggestions_count': len(self.suggestions),
+            'filtered_count': self.filtered_count,
+            'validation_strategy': self.validation_strategy.value,
+            'adaptation_mode': self.adaptation_mode.value,
+            'context_used': self.context_used,
+            'error_message': self.error_message,
+            'metadata': self.metadata
+        }
+
+
+class Validator:
+    """Класс для валидации и адаптации результатов предсказания"""
+    
+    def __init__(self, config: Optional[ValidationConfig] = None):
         """
-        Проверяет, можно ли адаптировать предложения под контекст.
+        Инициализация валидатора
         
         Args:
-            suggestions: Список предложенных команд
-            context: Контекст выполнения
-            
-        Returns:
-            True если можно адаптировать хотя бы одно предложение
+            config: Конфигурация валидации
         """
-        if not self.config["enable_adaptation"]:
-            return False
+        self.config = config or ValidationConfig()
+        self.logger = self._setup_logger()
+        self.context_cache: Dict[str, Context] = {}
+        self.validation_rules: List[Callable] = []
+        self.adaptation_rules: List[Callable] = []
         
-        if not suggestions:
-            return False
-        
-        # Проверяем каждое предложение
-        for suggestion in suggestions:
-            if self._can_adapt_single(suggestion, context):
-                return True
-        
-        return False
+        # Инициализация стандартных правил
+        self._init_default_rules()
     
-    def adapt(self, suggestions: List[CommandSuggestion], context: Dict[str, Any]) -> List[CommandSuggestion]:
+    def _setup_logger(self) -> logging.Logger:
+        """Настройка логгера"""
+        logger = logging.getLogger(__name__)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        
+        if self.config.enable_logging:
+            logger.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.WARNING)
+        
+        return logger
+    
+    def _init_default_rules(self) -> None:
+        """Инициализация стандартных правил валидации и адаптации"""
+        # Правила валидации
+        self.add_validation_rule(self._rule_min_confidence)
+        self.add_validation_rule(self._rule_min_suggestions)
+        self.add_validation_rule(self._rule_exact_match_required)
+        
+        # Правила адаптации
+        self.add_adaptation_rule(self._rule_filter_by_context)
+        self.add_adaptation_rule(self._rule_boost_by_history)
+        self.add_adaptation_rule(self._rule_adjust_by_time)
+        self.add_adaptation_rule(self._rule_limit_suggestions)
+    
+    def add_validation_rule(self, rule_func: Callable) -> None:
         """
-        Адаптирует предложенные команды под текущий контекст.
+        Добавление пользовательского правила валидации
         
         Args:
-            suggestions: Список предложенных команд
-            context: Контекст выполнения
-            
-        Returns:
-            Список адаптированных команд
+            rule_func: Функция правила (принимает suggestions, context, config)
         """
-        if not self.can_adapt(suggestions, context):
-            return []
-        
-        adapted = []
-        
-        for suggestion in suggestions:
-            # Проверяем, нужно ли адаптировать это предложение
-            if suggestion.match_score < self.config["min_confidence_for_adaptation"]:
-                continue
-            
-            # Пробуем адаптировать каждое предложение
-            adapted_versions = self._adapt_single(suggestion, context)
-            adapted.extend(adapted_versions)
-        
-        # Удаляем дубликаты и сортируем по confidence
-        unique_adapted = self._deduplicate_suggestions(adapted)
-        unique_adapted.sort(key=lambda x: x.match_score, reverse=True)
-        
-        return unique_adapted
+        self.validation_rules.append(rule_func)
+        self.logger.info(f"Added validation rule: {rule_func.__name__}")
     
-    def validate_command(self, command_text: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    def add_adaptation_rule(self, rule_func: Callable) -> None:
         """
-        Проверяет команду на корректность в данном контексте.
+        Добавление пользовательского правила адаптации
         
         Args:
-            command_text: Текст команды для валидации
-            context: Контекст выполнения
+            rule_func: Функция правила (принимает suggestions, context, config)
+        """
+        self.adaptation_rules.append(rule_func)
+        self.logger.info(f"Added adaptation rule: {rule_func.__name__}")
+    
+    def is_confident(self, adv_res: AdvinationResult, min_confidence: Optional[float] = None) -> bool:
+        """
+        Проверка доверия к результату предсказания
+        
+        Args:
+            adv_res: Результат предсказания
+            min_confidence: Минимальное доверие (если None, используется из конфига)
             
         Returns:
-            Словарь с результатами валидации
+            True если доверие выше порога
         """
-        # Проверяем кэш
-        cache_key = f"{command_text}_{str(context)}"
-        if cache_key in self.validation_cache:
-            return self.validation_cache[cache_key].copy()
+        threshold = min_confidence or self.config.min_confidence
+        result = adv_res.confidence >= threshold
         
-        issues = []
-        warnings = []
-        metadata = {}
-        
-        # Разбираем команду на токены
-        tokens = command_text.split()
-        if not tokens:
-            issues.append("Пустая команда")
-            result = self._build_validation_result(command_text, False, issues, warnings, metadata)
-            self.validation_cache[cache_key] = result
-            return result
-        
-        first_token = tokens[0].lower()
-        
-        # 1. Проверка синтаксиса
-        if self.config["validation_rules"]["check_syntax"]:
-            syntax_issues = self._check_syntax(command_text, context)
-            issues.extend(syntax_issues)
-        
-        # 2. Проверка известности команды
-        known_commands = self._get_known_commands_for_context(context)
-        if first_token not in known_commands:
-            warnings.append(f"Неизвестная команда: {first_token}")
-            metadata["unknown_command"] = True
-        
-        # 3. Проверка параметров для домен-специфичных команд
-        domain = context.get("domain")
-        if domain and domain in self.config["domain_specific_rules"]:
-            domain_rules = self.config["domain_specific_rules"][domain]
-            
-            # Проверка обязательных параметров
-            if "required_params" in domain_rules:
-                for param in domain_rules["required_params"]:
-                    param_pattern = f"-{param}" if len(param) == 1 else f"--{param}"
-                    if param_pattern not in command_text and f"{{{param}}}" not in command_text:
-                        issues.append(f"Отсутствует обязательный параметр: {param}")
-        
-        # 4. Проверка деструктивных команд
-        if self.config["validation_rules"]["warn_destructive"]:
-            destructive_commands = {"rm", "rmdir", "format", "dd", "shred"}
-            if first_token in destructive_commands:
-                warnings.append(f"Деструктивная команда: {first_token}")
-                metadata["destructive"] = True
-        
-        # 5. Проверка разрешений (заглушка для реальной системы)
-        if self.config["validation_rules"]["check_permissions"]:
-            sudo_commands = {"apt", "systemctl", "service", "mount"}
-            if first_token in sudo_commands and not command_text.startswith("sudo"):
-                warnings.append(f"Для команды {first_token} могут потребоваться права sudo")
-                metadata["requires_sudo"] = True
-        
-        # Анализ сложности команды
-        complexity_score = self._calculate_complexity(command_text)
-        metadata["complexity"] = complexity_score
-        metadata["token_count"] = len(tokens)
-        
-        if complexity_score > 0.7:
-            warnings.append("Сложная команда с множеством параметров")
-        
-        # Проверяем наличие общих ошибок
-        common_errors = self._check_common_errors(command_text)
-        issues.extend(common_errors)
-        
-        # Строим результат
-        is_valid = len(issues) == 0
-        result = self._build_validation_result(command_text, is_valid, issues, warnings, metadata)
-        
-        # Сохраняем в кэш
-        self.validation_cache[cache_key] = result.copy()
+        self.logger.debug(
+            f"Confidence check: {adv_res.confidence:.2f} >= {threshold:.2f} = {result}"
+        )
         
         return result
     
-    def batch_validate(self, commands: List[str], context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def validate(self, adv_res: AdvinationResult, context: Optional[Context] = None) -> ValidationResult:
         """
-        Пакетная валидация нескольких команд.
-        """
-        return [self.validate_command(cmd, context) for cmd in commands]
-    
-    def suggest_corrections(self,
-                           command_text: str,
-                           context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """
-        Предлагает исправления для невалидной команды.
-        """
-        validation_result = self.validate_command(command_text, context)
+        Полная валидация результата предсказания
         
-        if validation_result["is_valid"]:
+        Args:
+            adv_res: Результат предсказания
+            context: Контекст выполнения
+            
+        Returns:
+            ValidationResult с результатами валидации
+        """
+        try:
+            self.logger.info(f"Starting validation for query: {adv_res.query}")
+            
+            # Базовые проверки
+            if adv_res.result_type == AdvinationResultType.ERROR:
+                return ValidationResult(
+                    is_valid=False,
+                    confidence=0.0,
+                    suggestions=[],
+                    filtered_count=0,
+                    validation_strategy=self.config.strategy,
+                    adaptation_mode=self.config.adaptation_mode,
+                    context_used=False,
+                    error_message=adv_res.error_message
+                )
+            
+            if adv_res.result_type == AdvinationResultType.NO_MATCH:
+                return ValidationResult(
+                    is_valid=False,
+                    confidence=0.0,
+                    suggestions=[],
+                    filtered_count=0,
+                    validation_strategy=self.config.strategy,
+                    adaptation_mode=self.config.adaptation_mode,
+                    context_used=False,
+                    error_message="No matches found"
+                )
+            
+            # Применяем адаптацию
+            adapted_suggestions = self.adapt(
+                adv_res.suggestions, 
+                context or Context()
+            )
+            
+            # Применяем правила валидации
+            is_valid = True
+            error_messages = []
+            
+            for rule in self.validation_rules:
+                try:
+                    rule_result, message = rule(adapted_suggestions, context, self.config)
+                    if not rule_result:
+                        is_valid = False
+                        if message:
+                            error_messages.append(message)
+                except Exception as e:
+                    self.logger.error(f"Error in validation rule {rule.__name__}: {e}")
+                    is_valid = False
+                    error_messages.append(f"Validation rule error: {e}")
+            
+            # Вычисляем итоговое доверие
+            final_confidence = self._calculate_final_confidence(
+                adv_res.confidence, 
+                adapted_suggestions
+            )
+            
+            # Создаем результат валидации
+            validation_result = ValidationResult(
+                is_valid=is_valid,
+                confidence=final_confidence,
+                suggestions=adapted_suggestions,
+                filtered_count=len(adv_res.suggestions) - len(adapted_suggestions),
+                validation_strategy=self.config.strategy,
+                adaptation_mode=self.config.adaptation_mode,
+                context_used=context is not None,
+                error_message="; ".join(error_messages) if error_messages else None
+            )
+            
+            self.logger.info(
+                f"Validation complete: valid={is_valid}, "
+                f"confidence={final_confidence:.2f}, "
+                f"suggestions={len(adapted_suggestions)}"
+            )
+            
+            return validation_result
+            
+        except Exception as e:
+            self.logger.error(f"Validation error: {e}")
+            return ValidationResult(
+                is_valid=False,
+                confidence=0.0,
+                suggestions=[],
+                filtered_count=0,
+                validation_strategy=self.config.strategy,
+                adaptation_mode=self.config.adaptation_mode,
+                context_used=False,
+                error_message=f"Validation error: {e}"
+            )
+    
+    def adapt(self, suggestions: List[Suggestion], context: Optional[Context] = None) -> List[Suggestion]:
+        """
+        Адаптация предложений на основе контекста
+        
+        Args:
+            suggestions: Список предложений
+            context: Контекст выполнения
+            
+        Returns:
+            Адаптированный список предложений
+        """
+        if not suggestions:
             return []
         
-        corrections = []
+        context = context or Context()
+        adapted = suggestions.copy()
         
-        # 1. Исправление опечаток в известных командах
-        typo_corrections = self._suggest_typo_corrections(command_text, context)
-        corrections.extend(typo_corrections)
+        # Применяем правила адаптации в порядке их добавления
+        for rule in self.adaptation_rules:
+            try:
+                adapted = rule(adapted, context, self.config)
+                self.logger.debug(
+                    f"Applied adaptation rule {rule.__name__}: "
+                    f"{len(adapted)} suggestions remaining"
+                )
+            except Exception as e:
+                self.logger.error(f"Error in adaptation rule {rule.__name__}: {e}")
         
-        # 2. Исправление параметров
-        param_corrections = self._suggest_parameter_corrections(command_text, context)
-        corrections.extend(param_corrections)
+        # Сортируем по убыванию доверия
+        adapted.sort(key=lambda x: x.confidence, reverse=True)
         
-        # 3. Предложение альтернативных команд
-        alternative_corrections = self._suggest_alternatives(command_text, context)
-        corrections.extend(alternative_corrections)
+        # Ограничиваем количество предложений
+        if len(adapted) > self.config.max_suggestions:
+            adapted = adapted[:self.config.max_suggestions]
         
-        # Удаляем дубликаты и сортируем
-        unique_corrections = self._deduplicate_suggestions(corrections)
-        unique_corrections.sort(key=lambda x: x.match_score, reverse=True)
+        return adapted
+    
+    def _rule_min_confidence(self, suggestions: List[Suggestion], 
+                           context: Context, config: ValidationConfig) -> Tuple[bool, str]:
+        """Правило: минимальное доверие"""
+        if not suggestions:
+            return False, "No suggestions available"
         
-        return unique_corrections[:5]  # Ограничиваем количество предложений
+        max_confidence = max(s.confidence for s in suggestions)
+        if max_confidence < config.min_confidence:
+            return False, f"Max confidence {max_confidence:.2f} below threshold {config.min_confidence:.2f}"
+        
+        return True, ""
+    
+    def _rule_min_suggestions(self, suggestions: List[Suggestion],
+                            context: Context, config: ValidationConfig) -> Tuple[bool, str]:
+        """Правило: минимальное количество предложений"""
+        if len(suggestions) < config.min_suggestions:
+            return False, f"Only {len(suggestions)} suggestions, need at least {config.min_suggestions}"
+        
+        return True, ""
+    
+    def _rule_exact_match_required(self, suggestions: List[Suggestion],
+                                 context: Context, config: ValidationConfig) -> Tuple[bool, str]:
+        """Правило: требование точного совпадения"""
+        if config.require_exact_match:
+            exact_matches = [s for s in suggestions if s.confidence == 1.0]
+            if not exact_matches:
+                return False, "No exact matches found (require_exact_match=True)"
+        
+        return True, ""
+    
+    def _rule_filter_by_context(self, suggestions: List[Suggestion],
+                              context: Context, config: ValidationConfig) -> List[Suggestion]:
+        """Правило: фильтрация по контексту"""
+        if not config.use_context or not context.domain:
+            return suggestions
+        
+        filtered = []
+        for suggestion in suggestions:
+            # Проверяем совпадение домена
+            if context.domain in suggestion.matched_tags:
+                filtered.append(suggestion)
+            # Проверяем метаданные команды
+            elif 'domains' in suggestion.metadata:
+                if context.domain in suggestion.metadata['domains']:
+                    filtered.append(suggestion)
+            # Если нет явного совпадения, но есть другие контекстные признаки
+            elif self._check_context_compatibility(suggestion, context):
+                filtered.append(suggestion)
+        
+        return filtered
+    
+    def _rule_boost_by_history(self, suggestions: List[Suggestion],
+                             context: Context, config: ValidationConfig) -> List[Suggestion]:
+        """Правило: усиление на основе истории"""
+        if not context.history:
+            return suggestions
+        
+        boosted = []
+        for suggestion in suggestions:
+            # Увеличиваем доверие, если команда использовалась ранее
+            usage_count = context.history.count(suggestion.command_name)
+            if usage_count > 0:
+                # Логарифмическое усиление (чем больше использований, тем меньше прирост)
+                boost = min(0.2, 0.05 * (usage_count ** 0.5))
+                new_suggestion = Suggestion(
+                    command_name=suggestion.command_name,
+                    confidence=min(1.0, suggestion.confidence + boost),
+                    matched_tokens=suggestion.matched_tokens.copy(),
+                    command_description=suggestion.command_description,
+                    matched_tags=suggestion.matched_tags.copy(),
+                    metadata=suggestion.metadata.copy()
+                )
+                new_suggestion.metadata['history_boost'] = boost
+                boosted.append(new_suggestion)
+            else:
+                boosted.append(suggestion)
+        
+        return boosted
+    
+    def _rule_adjust_by_time(self, suggestions: List[Suggestion],
+                           context: Context, config: ValidationConfig) -> List[Suggestion]:
+        """Правило: корректировка по времени"""
+        if not context.time:
+            return suggestions
+        
+        adjusted = []
+        current_hour = context.time.hour
+        
+        for suggestion in suggestions:
+            # Пример: усиление команд администрирования в рабочее время
+            if 'admin' in suggestion.matched_tags:
+                if 9 <= current_hour <= 18:  # Рабочее время
+                    boost = 0.1
+                    new_confidence = min(1.0, suggestion.confidence + boost)
+                    new_suggestion = Suggestion(
+                        command_name=suggestion.command_name,
+                        confidence=new_confidence,
+                        matched_tokens=suggestion.matched_tokens.copy(),
+                        command_description=suggestion.command_description,
+                        matched_tags=suggestion.matched_tags.copy(),
+                        metadata=suggestion.metadata.copy()
+                    )
+                    new_suggestion.metadata['time_adjustment'] = boost
+                    adjusted.append(new_suggestion)
+                    continue
+            
+            # Пример: ослабление системных команд в нерабочее время
+            if 'system' in suggestion.matched_tags:
+                if current_hour < 6 or current_hour > 22:  # Ночное время
+                    penalty = 0.15
+                    new_confidence = max(0.0, suggestion.confidence - penalty)
+                    new_suggestion = Suggestion(
+                        command_name=suggestion.command_name,
+                        confidence=new_confidence,
+                        matched_tokens=suggestion.matched_tokens.copy(),
+                        command_description=suggestion.command_description,
+                        matched_tags=suggestion.matched_tags.copy(),
+                        metadata=suggestion.metadata.copy()
+                    )
+                    new_suggestion.metadata['time_adjustment'] = -penalty
+                    adjusted.append(new_suggestion)
+                    continue
+            
+            adjusted.append(suggestion)
+        
+        return adjusted
+    
+    def _rule_limit_suggestions(self, suggestions: List[Suggestion],
+                              context: Context, config: ValidationConfig) -> List[Suggestion]:
+        """Правило: ограничение количества предложений"""
+        if len(suggestions) <= config.max_suggestions:
+            return suggestions
+        
+        # Оставляем топ-N по доверию
+        return suggestions[:config.max_suggestions]
+    
+    def _check_context_compatibility(self, suggestion: Suggestion, context: Context) -> bool:
+        """
+        Проверка совместимости предложения с контекстом
+        
+        Args:
+            suggestion: Предложение
+            context: Контекст
+            
+        Returns:
+            True если предложение совместимо с контекстом
+        """
+        # Проверка роли пользователя
+        if context.user_role:
+            if 'roles' in suggestion.metadata:
+                if context.user_role not in suggestion.metadata['roles']:
+                    return False
+        
+        # Проверка окружения
+        if context.environment:
+            if 'environments' in suggestion.metadata:
+                if context.environment not in suggestion.metadata['environments']:
+                    return False
+        
+        # Проверка местоположения
+        if context.location:
+            if 'locations' in suggestion.metadata:
+                if context.location not in suggestion.metadata['locations']:
+                    return False
+        
+        return True
+    
+    def _calculate_final_confidence(self, base_confidence: float, 
+                                  suggestions: List[Suggestion]) -> float:
+        """
+        Вычисление итогового доверия
+        
+        Args:
+            base_confidence: Базовое доверие из AdvinationResult
+            suggestions: Адаптированные предложения
+            
+        Returns:
+            Итоговое доверие
+        """
+        if not suggestions:
+            return 0.0
+        
+        # Используем максимальное доверие среди предложений
+        max_suggestion_confidence = max(s.confidence for s in suggestions)
+        
+        # Комбинируем с базовым доверием (взвешенное среднее)
+        final_confidence = (base_confidence * 0.3 + max_suggestion_confidence * 0.7)
+        
+        return min(1.0, final_confidence)
+    
+    def update_config(self, **kwargs) -> None:
+        """
+        Обновление конфигурации валидатора
+        
+        Args:
+            **kwargs: Параметры конфигурации
+        """
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+                self.logger.info(f"Updated config: {key} = {value}")
+    
+    def save_context(self, key: str, context: Context) -> None:
+        """
+        Сохранение контекста в кэш
+        
+        Args:
+            key: Ключ для сохранения
+            context: Контекст для сохранения
+        """
+        self.context_cache[key] = context
+        self.logger.debug(f"Saved context with key: {key}")
+    
+    def load_context(self, key: str) -> Optional[Context]:
+        """
+        Загрузка контекста из кэша
+        
+        Args:
+            key: Ключ контекста
+            
+        Returns:
+            Контекст или None если не найден
+        """
+        context = self.context_cache.get(key)
+        if context:
+            self.logger.debug(f"Loaded context with key: {key}")
+        return context
+    
+    def clear_context_cache(self) -> None:
+        """Очистка кэша контекстов"""
+        self.context_cache.clear()
+        self.logger.info("Cleared context cache")
+    
+    def batch_validate(self, adv_results: List[AdvinationResult], 
+                      context: Optional[Context] = None) -> List[ValidationResult]:
+        """
+        Пакетная валидация результатов
+        
+        Args:
+            adv_results: Список результатов предсказания
+            context: Контекст выполнения
+            
+        Returns:
+            Список результатов валидации
+        """
+        self.logger.info(f"Starting batch validation for {len(adv_results)} results")
+        return [self.validate(result, context) for result in adv_results]
     
     def get_validation_stats(self) -> Dict[str, Any]:
         """
-        Возвращает статистику валидации.
+        Получение статистики валидатора
+        
+        Returns:
+            Словарь со статистикой
         """
-        total_validations = len(self.validation_cache)
-        valid_commands = sum(1 for result in self.validation_cache.values() if result["is_valid"])
-        
         return {
-            "total_validations": total_validations,
-            "valid_commands": valid_commands,
-            "invalid_commands": total_validations - valid_commands,
-            "cache_hit_ratio": 0.0,  # Можно рассчитать при реальном использовании
-            "most_common_issues": self._get_most_common_issues()
-        }
-    
-    # Вспомогательные методы
-    
-    def _can_adapt_single(self, suggestion: CommandSuggestion, context: Dict[str, Any]) -> bool:
-        """Проверяет, можно ли адаптировать одно предложение."""
-        # Проверяем известность первого токена
-        tokens = suggestion.text.split()
-        if not tokens:
-            return False
-        
-        first_token = tokens[0].lower()
-        known_commands = self._get_known_commands_for_context(context)
-        
-        return first_token in known_commands
-    
-    def _adapt_single(self, suggestion: CommandSuggestion, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """Адаптирует одно предложение под контекст."""
-        adapted_versions = []
-        
-        # Базовая адаптация: подстановка контекстных значений
-        base_adapted = self._basic_adaptation(suggestion, context)
-        if base_adapted:
-            adapted_versions.append(base_adapted)
-        
-        # Расширенная адаптация: добавление контекстных флагов
-        if self.config["adaptation_rules"]["context_aware_expansion"]:
-            expanded = self._context_expansion(suggestion, context)
-            adapted_versions.extend(expanded)
-        
-        # Адаптация параметров
-        if self.config["adaptation_rules"]["parameter_filling"]:
-            param_filled = self._parameter_filling(suggestion, context)
-            if param_filled:
-                adapted_versions.append(param_filled)
-        
-        return adapted_versions
-    
-    def _basic_adaptation(self, suggestion: CommandSuggestion, context: Dict[str, Any]) -> Optional[CommandSuggestion]:
-        """Базовая адаптация с подстановкой путей и параметров."""
-        adapted_text = suggestion.text
-        
-        # Подстановка пути из контекста
-        if self.config["adaptation_rules"]["path_substitution"]:
-            if "current_path" in context and "." in adapted_text:
-                adapted_text = adapted_text.replace(".", context["current_path"])
-            
-            if "home_path" in context and "~" in adapted_text:
-                adapted_text = adapted_text.replace("~", context["home_path"])
-        
-        # Подстановка параметров из контекста
-        if "params" in context:
-            for key, value in context["params"].items():
-                placeholder = f"{{{key}}}"
-                if placeholder in adapted_text:
-                    adapted_text = adapted_text.replace(placeholder, str(value))
-        
-        # Если текст не изменился, возвращаем None
-        if adapted_text == suggestion.text:
-            return None
-        
-        return CommandSuggestion(
-            text=adapted_text,
-            source="adapted",
-            match_score=suggestion.match_score * 0.9,  # Чуть ниже уверенность
-            metadata={
-                **suggestion.metadata,
-                "original": suggestion.text,
-                "adapted": True,
-                "adaptation_type": "basic",
-                "adaptation_context": {k: v for k, v in context.items() if k != "params"}
+            'config': {
+                'min_confidence': self.config.min_confidence,
+                'min_suggestions': self.config.min_suggestions,
+                'max_suggestions': self.config.max_suggestions,
+                'strategy': self.config.strategy.value,
+                'adaptation_mode': self.config.adaptation_mode.value,
+                'use_context': self.config.use_context,
+                'require_exact_match': self.config.require_exact_match
+            },
+            'rules': {
+                'validation_rules': len(self.validation_rules),
+                'adaptation_rules': len(self.adaptation_rules),
+                'context_cache_size': len(self.context_cache)
             }
-        )
-    
-    def _context_expansion(self, suggestion: CommandSuggestion, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """Расширение команды контекстно-специфичными флагами."""
-        expanded = []
-        tokens = suggestion.text.split()
-        
-        if not tokens:
-            return expanded
-        
-        first_token = tokens[0].lower()
-        domain = context.get("domain")
-        
-        # Добавление флагов для разных доменов
-        if domain == "git" and first_token == "git":
-            if len(tokens) > 1 and tokens[1] == "commit":
-                expanded_text = suggestion.text + " -m 'Update'"
-                expanded.append(
-                    CommandSuggestion(
-                        text=expanded_text,
-                        source="context_expansion",
-                        match_score=suggestion.match_score * 0.85,
-                        metadata={
-                            **suggestion.metadata,
-                            "expansion": "added_commit_message",
-                            "context_domain": domain
-                        }
-                    )
-                )
-        
-        elif domain == "docker" and first_token == "docker":
-            if len(tokens) > 1 and tokens[1] == "run":
-                expanded_text = suggestion.text + " -it --rm"
-                expanded.append(
-                    CommandSuggestion(
-                        text=expanded_text,
-                        source="context_expansion",
-                        match_score=suggestion.match_score * 0.85,
-                        metadata={
-                            **suggestion.metadata,
-                            "expansion": "added_docker_flags",
-                            "context_domain": domain
-                        }
-                    )
-                )
-        
-        return expanded
-    
-    def _parameter_filling(self, suggestion: CommandSuggestion, context: Dict[str, Any]) -> Optional[CommandSuggestion]:
-        """Заполнение недостающих параметров на основе контекста."""
-        domain = context.get("domain")
-        
-        if not domain or domain not in self.config["domain_specific_rules"]:
-            return None
-        
-        domain_rules = self.config["domain_specific_rules"][domain]
-        if "common_flags" not in domain_rules:
-            return None
-        
-        # Проверяем, есть ли уже эти флаги в команде
-        command_text = suggestion.text
-        added_flags = []
-        
-        for flag in domain_rules["common_flags"]:
-            if flag not in command_text:
-                command_text += f" {flag}"
-                added_flags.append(flag)
-        
-        if not added_flags:
-            return None
-        
-        return CommandSuggestion(
-            text=command_text,
-            source="parameter_filled",
-            match_score=suggestion.match_score * 0.8,
-            metadata={
-                **suggestion.metadata,
-                "added_flags": added_flags,
-                "parameter_filling": True
-            }
-        )
-    
-    def _check_syntax(self, command_text: str, context: Dict[str, Any]) -> List[str]:
-        """Проверка синтаксиса команды."""
-        issues = []
-        
-        # Проверка незакрытых кавычек
-        quote_count = command_text.count('"') + command_text.count("'")
-        if quote_count % 2 != 0:
-            issues.append("Незакрытые кавычки")
-        
-        # Проверка неправильных перенаправлений
-        if ">>" in command_text and ">" in command_text.replace(">>", ""):
-            issues.append("Неправильное использование перенаправления вывода")
-        
-        # Проверка синтаксиса для специфичных доменов
-        domain = context.get("domain")
-        if domain == "git":
-            if "git commit" in command_text and "-m" in command_text:
-                # Проверяем, что после -m есть сообщение
-                parts = command_text.split("-m")
-                if len(parts) < 2 or not parts[1].strip():
-                    issues.append("Флаг -m требует сообщения коммита")
-        
-        return issues
-    
-    def _calculate_complexity(self, command_text: str) -> float:
-        """Рассчитывает сложность команды."""
-        tokens = command_text.split()
-        if not tokens:
-            return 0.0
-        
-        # Факторы сложности
-        factors = {
-            "token_count": min(len(tokens) / 10, 1.0),
-            "has_pipes": 0.2 if "|" in command_text else 0.0,
-            "has_redirects": 0.2 if ">" in command_text or "<" in command_text else 0.0,
-            "has_subshell": 0.3 if "$(" in command_text or "`" in command_text else 0.0,
-            "has_regex": 0.2 if any(c in command_text for c in ["*", "?", "[", "]"]) else 0.0
         }
-        
-        # Взвешенная сумма
-        weights = {
-            "token_count": 0.4,
-            "has_pipes": 0.2,
-            "has_redirects": 0.15,
-            "has_subshell": 0.15,
-            "has_regex": 0.1
-        }
-        
-        complexity = sum(factors[key] * weights[key] for key in factors)
-        return min(complexity, 1.0)
+
+
+# Фабричные функции
+def create_validator(config: Optional[ValidationConfig] = None) -> Validator:
+    """
+    Создание экземпляра Validator
     
-    def _check_common_errors(self, command_text: str) -> List[str]:
-        """Проверка общих ошибок."""
-        issues = []
+    Args:
+        config: Конфигурация валидации
         
-        # Частые опечатки
-        common_typos = {
-            "sl": "ls",
-            "cd..": "cd ..",
-            "m kdir": "mkdir",
-            "git stauts": "git status",
-            "git commmit": "git commit"
-        }
-        
-        for typo, correction in common_typos.items():
-            if typo in command_text:
-                issues.append(f"Возможная опечатка: '{typo}' -> '{correction}'")
-        
-        return issues
+    Returns:
+        Экземпляр Validator
+    """
+    return Validator(config)
+
+
+def get_default_validator() -> Validator:
+    """
+    Получение глобального экземпляра Validator
     
-    def _suggest_typo_corrections(self, command_text: str, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """Предлагает исправления опечаток."""
-        corrections = []
-        
-        # Простые замены
-        replacements = {
-            "sl": "ls",
-            "cd..": "cd ..",
-            "m kdir": "mkdir",
-            "git stauts": "git status",
-            "git commmit": "git commit",
-            "docer": "docker",
-            "pythn": "python"
-        }
-        
-        for wrong, correct in replacements.items():
-            if wrong in command_text:
-                corrected = command_text.replace(wrong, correct)
-                corrections.append(
-                    CommandSuggestion(
-                        text=corrected,
-                        source="typo_correction",
-                        match_score=0.8,
-                        metadata={
-                            "original": command_text,
-                            "corrected_from": wrong,
-                            "corrected_to": correct
-                        }
-                    )
-                )
-        
-        return corrections
-    
-    def _suggest_parameter_corrections(self, command_text: str, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """Предлагает исправления параметров."""
-        # Заглушка для реальной реализации
-        return []
-    
-    def _suggest_alternatives(self, command_text: str, context: Dict[str, Any]) -> List[CommandSuggestion]:
-        """Предлагает альтернативные команды."""
-        # Заглушка для реальной реализации
-        return []
-    
-    def _get_known_commands_for_context(self, context: Dict[str, Any]) -> Set[str]:
-        """Возвращает набор известных команд для контекста."""
-        known_commands = set()
-        
-        # Добавляем команды из всех доменов
-        for domain_commands in self.config["known_tokens"].values():
-            known_commands.update(domain_commands)
-        
-        # Добавляем домен-специфичные команды
-        domain = context.get("domain")
-        if domain and domain in self.config["known_tokens"]:
-            known_commands.update(self.config["known_tokens"][domain])
-        
-        return known_commands
-    
-    def _deduplicate_suggestions(self, suggestions: List[CommandSuggestion]) -> List[CommandSuggestion]:
-        """Удаляет дубликаты из списка предложений."""
-        seen = set()
-        unique = []
-        
-        for suggestion in suggestions:
-            key = suggestion.text
-            if key not in seen:
-                seen.add(key)
-                unique.append(suggestion)
-        
-        return unique
-    
-    def _build_validation_result(self,
-                                command_text: str,
-                                is_valid: bool,
-                                issues: List[str],
-                                warnings: List[str],
-                                metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Строит структурированный результат валидации."""
-        return {
-            "command": command_text,
-            "is_valid": is_valid,
-            "issues": issues,
-            "warnings": warnings,
-            "metadata": metadata,
-            "has_issues": len(issues) > 0,
-            "has_warnings": len(warnings) > 0,
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    def _get_most_common_issues(self) -> List[Dict[str, Any]]:
-        """Возвращает наиболее частые проблемы из кэша."""
-        issue_counts = {}
-        
-        for result in self.validation_cache.values():
-            for issue in result.get("issues", []):
-                issue_counts[issue] = issue_counts.get(issue, 0) + 1
-        
-        # Сортируем по частоте
-        sorted_issues = sorted(issue_counts.items(), key=lambda x: x[1], reverse=True)
-        
-        return [{"issue": issue, "count": count} for issue, count in sorted_issues[:10]]
+    Returns:
+        Глобальный экземпляр Validator
+    """
+    global _default_validator
+    if _default_validator is None:
+        _default_validator = create_validator()
+    return _default_validator
+
+
+# Глобальный экземпляр
+_default_validator: Optional[Validator] = None

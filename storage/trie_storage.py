@@ -1,1074 +1,628 @@
-﻿import json
-import pickle
-import hashlib
-from typing import List, Dict, Any, Optional, Set, Tuple
+﻿# storage/trie_storage.py
+"""
+Модуль для хранения и поиска команд с использованием префиксного дерева (Trie).
+Поддерживает точный и частичный поиск по токенам, префиксам и тегам.
+"""
+
+import json
+import sqlite3
 from pathlib import Path
-from datetime import datetime
-import os
+from typing import Dict, List, Set, Tuple, Optional, Any, Union
+import math
+
+
+class TrieNode:
+    """Узел префиксного дерева (Trie)"""
+    
+    def __init__(self):
+        self.children: Dict[str, 'TrieNode'] = {}
+        self.command_ids: Set[str] = set()
+        self.is_end_of_token: bool = False
+
+
+class Command:
+    """Класс для представления команды"""
+    
+    def __init__(self, name: str, description: str = "", tokens: List[str] = None, 
+                 tags: List[str] = None, metadata: Dict[str, Any] = None):
+        self.name = name
+        self.description = description
+        self.tokens = tokens or []
+        self.tags = tags or []
+        self.metadata = metadata or {}
+    
+    def __repr__(self):
+        return f"Command(name='{self.name}', tokens={self.tokens}, tags={self.tags})"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Преобразование команды в словарь"""
+        return {
+            'name': self.name,
+            'description': self.description,
+            'tokens': self.tokens,
+            'tags': self.tags,
+            'metadata': self.metadata
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Command':
+        """Создание команды из словаря"""
+        return cls(
+            name=data.get('name', ''),
+            description=data.get('description', ''),
+            tokens=data.get('tokens', []),
+            tags=data.get('tags', []),
+            metadata=data.get('metadata', {})
+        )
 
 
 class CommandTrie:
-    """
-    Trie-структура для быстрого поиска команд по префиксу.
-    Поддерживает инкрементальное обновление и сохранение на диск.
-    """
+    """Префиксное дерево для хранения и поиска команд"""
     
-    def __init__(self, data_dir: str = "data", config: Dict[str, Any] = None):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.config = config or {
-            "auto_save": True,
-            "save_interval_seconds": 300,
-            "max_commands": 10000,
-            "max_prefix_length": 100,
-            "enable_fuzzy_search": True,
-            "fuzzy_threshold": 0.6,
-            "compression": False,
-            "backup_on_save": True
-        }
-        
-        # Основные структуры данных
-        self.trie = {}  # Основная Trie-структура
-        self.commands: Dict[str, Dict] = {}  # command_id -> command_data
-        self.reverse_index: Dict[str, Set[str]] = {}  # command_text -> set(command_ids)
-        
-        # Метаданные
-        self.metadata = {
-            "total_commands": 0,
-            "total_searches": 0,
-            "total_inserts": 0,
-            "last_updated": datetime.now().isoformat(),
-            "version": "1.0",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Кэши для производительности
-        self.prefix_cache: Dict[str, List[str]] = {}
-        self.similarity_cache: Dict[str, List[Dict]] = {}
-        
-        # Статистика
-        self.stats = {
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "disk_reads": 0,
-            "disk_writes": 0
-        }
-        
-        # Загружаем из файла, если существует
-        self._load_from_disk()
+    def __init__(self):
+        self.root = TrieNode()
+        self.commands: Dict[str, Command] = {}
+        self.token_to_commands: Dict[str, Set[str]] = {}
+        self.tag_to_commands: Dict[str, Set[str]] = {}
     
-    def insert(self, command_data: Dict[str, Any]) -> str:
+    def insert(self, command: Command) -> None:
         """
-        Добавляет команду в Trie.
+        Вставка команды в Trie
         
         Args:
-            command_data: Словарь с данными команды.
-                         Должен содержать ключ 'command' (текст команды).
-        
-        Returns:
-            ID команды в хранилище.
+            command: Команда для вставки
         """
-        command_text = command_data.get("command", "").strip()
-        if not command_text:
-            raise ValueError("Command text cannot be empty")
-        
-        # Проверяем максимальную длину
-        if len(command_text) > self.config["max_prefix_length"]:
-            raise ValueError(f"Command too long: {len(command_text)} characters")
-        
-        # Проверяем максимальное количество команд
-        if len(self.commands) >= self.config["max_commands"]:
-            self._evict_old_commands()
-        
-        # Генерируем ID если нет
-        if "id" not in command_data:
-            command_data["id"] = self._generate_command_id(command_text)
-        
-        command_id = command_data["id"]
-        
-        # Если команда уже существует, обновляем её
-        if command_id in self.commands:
-            return self._update_existing_command(command_id, command_data)
-        
-        # Добавляем метаданные
-        if "created_at" not in command_data:
-            command_data["created_at"] = datetime.now().isoformat()
-        if "usage_count" not in command_data:
-            command_data["usage_count"] = 1
-        if "last_used" not in command_data:
-            command_data["last_used"] = datetime.now().isoformat()
-        
-        # Нормализуем текст команды для Trie
-        normalized_text = self._normalize_command_text(command_text)
-        
         # Сохраняем команду
-        self.commands[command_id] = command_data
+        self.commands[command.name] = command
         
-        # Добавляем в обратный индекс
-        if normalized_text not in self.reverse_index:
-            self.reverse_index[normalized_text] = set()
-        self.reverse_index[normalized_text].add(command_id)
+        # Индексируем по токенам
+        for token in command.tokens:
+            # Вставляем в Trie
+            node = self.root
+            for char in token:
+                if char not in node.children:
+                    node.children[char] = TrieNode()
+                node = node.children[char]
+            node.is_end_of_token = True
+            node.command_ids.add(command.name)
+            
+            # Индекс токен->команды
+            if token not in self.token_to_commands:
+                self.token_to_commands[token] = set()
+            self.token_to_commands[token].add(command.name)
         
-        # Добавляем в Trie
-        node = self.trie
-        for char in normalized_text:
-            if char not in node:
-                node[char] = {"__commands": set()}
-            node = node[char]
-            node["__commands"].add(command_id)
-        
-        # Помечаем конец слова
-        node["__end"] = True
-        
-        # Добавляем n-граммы для нечеткого поиска
-        if self.config["enable_fuzzy_search"]:
-            self._add_ngrams(command_id, normalized_text)
-        
-        # Обновляем метаданные
-        self.metadata["total_commands"] = len(self.commands)
-        self.metadata["total_inserts"] += 1
-        self.metadata["last_updated"] = datetime.now().isoformat()
-        
-        # Очищаем кэши
-        self._clear_cache_for_prefix(normalized_text[:3])
-        
-        # Сохраняем на диск
-        if self.config["auto_save"]:
-            self._schedule_save()
-        
-        return command_id
+        # Индексируем по тегам
+        for tag in command.tags:
+            if tag not in self.tag_to_commands:
+                self.tag_to_commands[tag] = set()
+            self.tag_to_commands[tag].add(command.name)
     
-    def search_exact(self, prefix: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search_exact(self, prefix: str) -> List[Command]:
         """
-        Ищет команды, точно начинающиеся с префикса.
+        Точный поиск команд по префиксу
         
         Args:
-            prefix: Префикс для поиска.
-            limit: Максимальное количество результатов.
-        
+            prefix: Префикс для поиска (может быть токеном или частью токена)
+            
         Returns:
-            Список команд, отсортированных по релевантности.
+            Список команд, точно соответствующих префиксу
         """
-        if not prefix:
-            return []
+        # Поиск по токенам
+        node = self.root
+        for char in prefix:
+            if char not in node.children:
+                return []
+            node = node.children[char]
         
-        # Проверяем кэш
-        cache_key = f"exact_{prefix}_{limit}"
-        if cache_key in self.prefix_cache:
-            command_ids = self.prefix_cache[cache_key]
-            self.stats["cache_hits"] += 1
-        else:
-            self.stats["cache_misses"] += 1
-            
-            # Ищем узел в Trie
-            node = self.trie
-            normalized_prefix = self._normalize_command_text(prefix)
-            
-            for char in normalized_prefix:
-                if char not in node:
-                    # Префикс не найден
-                    self.prefix_cache[cache_key] = []
-                    return []
-                node = node[char]
-            
-            # Собираем все команды из поддерва
-            command_ids = self._collect_command_ids(node, limit)
-            
-            # Сохраняем в кэш
-            self.prefix_cache[cache_key] = command_ids
+        # Если это конец токена, возвращаем команды
+        if node.is_end_of_token:
+            return [self.commands[cid] for cid in node.command_ids]
         
-        # Получаем данные команд
+        # Иначе проверяем все поддеревья
         results = []
-        for cmd_id in command_ids:
-            if cmd_id in self.commands:
-                cmd_data = self._prepare_command_result(cmd_id, prefix)
-                results.append(cmd_data)
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.is_end_of_token:
+                results.extend([self.commands[cid] for cid in current.command_ids])
+            stack.extend(current.children.values())
         
-        # Обновляем статистику
-        self.metadata["total_searches"] += 1
-        
-        return results[:limit]
+        return list(set(results))  # Убираем дубликаты
     
-    def search_similar(self,
-                      query: str,
-                      threshold: float = 0.3,
-                      limit: int = 3) -> List[Dict[str, Any]]:
+    def search_by_tokens(self, tokens: List[str]) -> List[Command]:
         """
-        Ищет команды, похожие на запрос.
-        Использует комбинацию методов для определения похожести.
+        Поиск команд по полному соответствию токенов
         
         Args:
-            query: Запрос для поиска похожих команд.
-            threshold: Порог похожести (0.0 - 1.0).
-            limit: Максимальное количество результатов.
-        
+            tokens: Список токенов для поиска
+            
         Returns:
-            Список похожих команд с оценкой похожести.
+            Список команд, содержащих все указанные токены
         """
-        if not query or not self.config["enable_fuzzy_search"]:
+        if not tokens:
             return []
         
-        # Проверяем кэш
-        cache_key = f"similar_{query}_{threshold}_{limit}"
-        if cache_key in self.similarity_cache:
-            self.stats["cache_hits"] += 1
-            return self.similarity_cache[cache_key][:limit]
+        # Находим команды для каждого токена
+        command_sets = []
+        for token in tokens:
+            if token in self.token_to_commands:
+                command_sets.append(self.token_to_commands[token])
+            else:
+                return []  # Если хотя бы один токен не найден
         
-        self.stats["cache_misses"] += 1
-        
-        normalized_query = self._normalize_command_text(query)
-        similar_commands = []
-        
-        # Метод 1: Поиск по префиксу с допущениями
-        prefix_results = self._fuzzy_prefix_search(normalized_query, threshold)
-        similar_commands.extend(prefix_results)
-        
-        # Метод 2: Поиск по n-граммам
-        ngram_results = self._ngram_search(normalized_query, threshold)
-        similar_commands.extend(ngram_results)
-        
-        # Метод 3: Поиск по токенам
-        token_results = self._token_search(normalized_query, threshold)
-        similar_commands.extend(token_results)
-        
-        # Удаляем дубликаты и объединяем результаты
-        unique_results = self._deduplicate_similar_results(similar_commands)
-        
-        # Сортируем по похожести
-        unique_results.sort(key=lambda x: x.get("similarity", 0), reverse=True)
-        
-        # Сохраняем в кэш
-        self.similarity_cache[cache_key] = unique_results
-        
-        return unique_results[:limit]
+        # Находим пересечение
+        common_commands = set.intersection(*command_sets)
+        return [self.commands[cid] for cid in common_commands]
     
-    def get_command(self, command_id: str) -> Optional[Dict[str, Any]]:
-        """Возвращает команду по ID."""
-        return self.commands.get(command_id)
-    
-    def get_command_by_text(self, command_text: str) -> Optional[Dict[str, Any]]:
-        """Возвращает команду по тексту."""
-        normalized = self._normalize_command_text(command_text)
-        if normalized in self.reverse_index:
-            for cmd_id in self.reverse_index[normalized]:
-                return self.commands.get(cmd_id)
-        return None
-    
-    def update_usage(self, command_id: str, increment: int = 1) -> bool:
-        """Увеличивает счётчик использования команды."""
-        if command_id in self.commands:
-            current = self.commands[command_id].get("usage_count", 0)
-            self.commands[command_id]["usage_count"] = current + increment
-            self.commands[command_id]["last_used"] = datetime.now().isoformat()
-            
-            # Обновляем метаданные
-            self.metadata["last_updated"] = datetime.now().isoformat()
-            
-            # Сохраняем на диск
-            if self.config["auto_save"]:
-                self._schedule_save()
-            
-            return True
-        return False
-    
-    def delete_command(self, command_id: str) -> bool:
-        """Удаляет команду из хранилища."""
-        if command_id not in self.commands:
-            return False
-        
-        # Получаем текст команды
-        cmd_data = self.commands[command_id]
-        cmd_text = cmd_data.get("command", "")
-        normalized_text = self._normalize_command_text(cmd_text)
-        
-        # Удаляем из Trie
-        node = self.trie
-        for char in normalized_text:
-            if char in node:
-                node = node[char]
-                if "__commands" in node and command_id in node["__commands"]:
-                    node["__commands"].remove(command_id)
-        
-        # Удаляем из обратного индекса
-        if normalized_text in self.reverse_index:
-            self.reverse_index[normalized_text].discard(command_id)
-            if not self.reverse_index[normalized_text]:
-                del self.reverse_index[normalized_text]
-        
-        # Удаляем n-граммы
-        if self.config["enable_fuzzy_search"]:
-            self._remove_ngrams(command_id, normalized_text)
-        
-        # Удаляем из основного хранилища
-        del self.commands[command_id]
-        
-        # Обновляем метаданные
-        self.metadata["total_commands"] = len(self.commands)
-        self.metadata["last_updated"] = datetime.now().isoformat()
-        
-        # Очищаем кэши
-        self._clear_all_caches()
-        
-        # Сохраняем на диск
-        if self.config["auto_save"]:
-            self._schedule_save()
-        
-        return True
-    
-    def bulk_insert(self, commands: List[Dict[str, Any]]) -> List[str]:
-        """Пакетная вставка команд."""
-        ids = []
-        for cmd_data in commands:
-            try:
-                cmd_id = self.insert(cmd_data)
-                ids.append(cmd_id)
-            except Exception as e:
-                print(f"Warning: Failed to insert command {cmd_data.get('command', 'unknown')}: {e}")
-        
-        # Сохраняем на диск после пакетной вставки
-        if self.config["auto_save"]:
-            self.save_to_disk()
-        
-        return ids
-    
-    def search_with_filters(self,
-                           prefix: str,
-                           filters: Dict[str, Any],
-                           limit: int = 5) -> List[Dict[str, Any]]:
+    def search_partial(self, prefix: str, threshold: float = 0.3) -> List[Tuple[Command, float]]:
         """
-        Поиск с дополнительными фильтрами.
+        Частичный поиск команд по префиксу с оценкой схожести
         
         Args:
             prefix: Префикс для поиска
-            filters: Словарь с фильтрами
-            limit: Максимальное количество результатов
-        
+            threshold: Порог схожести (0-1)
+            
         Returns:
-            Отфильтрованный список команд
+            Список кортежей (команда, оценка_схожести)
         """
-        # Сначала выполняем обычный поиск
-        results = self.search_exact(prefix, limit * 2)  # Берем больше, чтобы отфильтровать
+        results = []
         
-        if not results or not filters:
-            return results[:limit]
+        # Разбиваем префикс на слова
+        prefix_words = prefix.lower().split()
         
-        filtered_results = []
-        
-        for cmd in results:
-            include = True
-            
-            # Фильтр по минимальному usage_count
-            if "min_usage" in filters:
-                if cmd.get("usage_count", 0) < filters["min_usage"]:
-                    include = False
-            
-            # Фильтр по категории
-            if "category" in filters:
-                if cmd.get("category", "") != filters["category"]:
-                    include = False
-            
-            # Фильтр по тегам
-            if "tags" in filters:
-                cmd_tags = set(cmd.get("tags", []))
-                filter_tags = set(filters["tags"])
-                if not filter_tags.issubset(cmd_tags):
-                    include = False
-            
-            # Фильтр по дате создания
-            if "created_after" in filters:
-                created_at = cmd.get("created_at", "")
-                if created_at:
-                    try:
-                        cmd_date = datetime.fromisoformat(created_at)
-                        filter_date = datetime.fromisoformat(filters["created_after"])
-                        if cmd_date < filter_date:
-                            include = False
-                    except ValueError:
-                        pass
-            
-            if include:
-                filtered_results.append(cmd)
-        
-        return filtered_results[:limit]
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Возвращает статистику хранилища."""
-        total_usage = sum(cmd.get("usage_count", 0) for cmd in self.commands.values())
-        avg_usage = total_usage / len(self.commands) if self.commands else 0
-        
-        # Анализ популярности
-        usage_distribution = {}
         for cmd in self.commands.values():
-            usage = cmd.get("usage_count", 0)
-            bucket = (usage // 10) * 10  # Группируем по десяткам
-            usage_distribution[bucket] = usage_distribution.get(bucket, 0) + 1
+            score = self._calculate_similarity_score(cmd, prefix_words, prefix)
+            if score >= threshold:
+                results.append((cmd, score))
         
-        return {
-            **self.metadata,
-            "total_usage": total_usage,
-            "avg_usage_per_command": avg_usage,
-            "unique_prefixes": self._count_unique_prefixes(),
-            "cache_stats": self.stats.copy(),
-            "memory_usage_mb": self._estimate_memory_usage(),
-            "usage_distribution": dict(sorted(usage_distribution.items())),
-            "top_commands": self._get_top_commands(5)
-        }
-    
-    def save_to_disk(self, backup: bool = None):
-        """Сохраняет Trie на диск."""
-        if backup is None:
-            backup = self.config["backup_on_save"]
-        
-        # Создаем backup если нужно
-        if backup:
-            self._create_backup()
-        
-        data_file = self.data_dir / "command_trie.pkl"
-        try:
-            save_data = {
-                'trie': self.trie,
-                'commands': self.commands,
-                'reverse_index': self.reverse_index,
-                'metadata': self.metadata,
-                'config': self.config
-            }
-            
-            with open(data_file, 'wb') as f:
-                if self.config["compression"]:
-                    import gzip
-                    with gzip.GzipFile(fileobj=f, mode='wb') as gz_file:
-                        pickle.dump(save_data, gz_file, protocol=pickle.HIGHEST_PROTOCOL)
-                else:
-                    pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            
-            self.stats["disk_writes"] += 1
-            self.metadata["last_saved"] = datetime.now().isoformat()
-            
-        except Exception as e:
-            print(f"Warning: Could not save Trie to disk: {e}")
-    
-    def load_from_disk(self) -> bool:
-        """Загружает Trie с диска."""
-        return self._load_from_disk()
-    
-    def export_to_json(self, filepath: str, indent: int = 2):
-        """Экспортирует все команды в JSON файл."""
-        export_data = {
-            "metadata": self.metadata,
-            "config": self.config,
-            "commands": list(self.commands.values())
-        }
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, indent=indent, ensure_ascii=False)
-    
-    def import_from_json(self, filepath: str, merge: bool = True):
-        """Импортирует команды из JSON файла."""
-        with open(filepath, 'r', encoding='utf-8') as f:
-            import_data = json.load(f)
-        
-        if not merge:
-            self.clear()
-        
-        for cmd_data in import_data.get("commands", []):
-            try:
-                self.insert(cmd_data)
-            except Exception as e:
-                print(f"Warning: Failed to import command: {e}")
-        
-        # Сохраняем после импорта
-        if self.config["auto_save"]:
-            self.save_to_disk()
-    
-    def clear(self):
-        """Очищает все данные в хранилище."""
-        self.trie = {}
-        self.commands.clear()
-        self.reverse_index.clear()
-        self.prefix_cache.clear()
-        self.similarity_cache.clear()
-        
-        self.metadata.update({
-            "total_commands": 0,
-            "total_searches": 0,
-            "total_inserts": 0,
-            "last_updated": datetime.now().isoformat()
-        })
-        
-        self.stats = {
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "disk_reads": 0,
-            "disk_writes": 0
-        }
-    
-    def optimize(self):
-        """Оптимизирует структуры данных."""
-        # Сжимаем Trie (удаляем пустые узлы)
-        self._compress_trie()
-        
-        # Очищаем кэши
-        self._clear_all_caches()
-        
-        # Перестраиваем обратный индекс если нужно
-        self._rebuild_reverse_index()
-        
-        print(f"Optimization complete. Commands: {len(self.commands)}, "
-              f"Trie nodes: {self._count_trie_nodes()}")
-    
-    # Вспомогательные методы
-    
-    def _normalize_command_text(self, text: str) -> str:
-        """Нормализует текст команды для Trie."""
-        # Приводим к нижнему регистру и удаляем лишние пробелы
-        normalized = ' '.join(text.lower().split())
-        
-        # Удаляем специальные символы, которые могут мешать поиску
-        # (но сохраняем важные для команд символы)
-        import re
-        normalized = re.sub(r'[^\w\s\-\.\/\@\:]', '', normalized)
-        
-        return normalized
-    
-    def _generate_command_id(self, command_text: str) -> str:
-        """Генерирует уникальный ID для команды."""
-        # Используем хеш команды + timestamp для уникальности
-        hash_obj = hashlib.md5(command_text.encode('utf-8'))
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        return f"{hash_obj.hexdigest()[:8]}_{timestamp}"
-    
-    def _update_existing_command(self, command_id: str, new_data: Dict[str, Any]) -> str:
-        """Обновляет существующую команду."""
-        old_data = self.commands[command_id]
-        
-        # Обновляем usage_count
-        old_usage = old_data.get("usage_count", 0)
-        new_usage = new_data.get("usage_count", 1)
-        old_data["usage_count"] = old_usage + new_usage
-        
-        # Обновляем метаданные
-        old_data["last_used"] = datetime.now().isoformat()
-        
-        # Обновляем другие поля если предоставлены
-        for key in ["description", "category", "tags", "parameters"]:
-            if key in new_data:
-                old_data[key] = new_data[key]
-        
-        # Обновляем обратный индекс если изменился текст команды
-        old_text = old_data.get("command", "")
-        new_text = new_data.get("command", "")
-        
-        if new_text and old_text != new_text:
-            # Удаляем старую запись из обратного индекса
-            old_normalized = self._normalize_command_text(old_text)
-            if old_normalized in self.reverse_index:
-                self.reverse_index[old_normalized].discard(command_id)
-                if not self.reverse_index[old_normalized]:
-                    del self.reverse_index[old_normalized]
-            
-            # Добавляем новую
-            new_normalized = self._normalize_command_text(new_text)
-            if new_normalized not in self.reverse_index:
-                self.reverse_index[new_normalized] = set()
-            self.reverse_index[new_normalized].add(command_id)
-            
-            # Обновляем текст в данных команды
-            old_data["command"] = new_text
-        
-        return command_id
-    
-    def _collect_command_ids(self, node: Dict, limit: int) -> List[str]:
-        """Собирает ID команд из поддерэва Trie."""
-        command_ids = set()
-        
-        def collect_recursive(current_node, ids_set):
-            if "__commands" in current_node:
-                ids_set.update(current_node["__commands"])
-            
-            for key, child_node in current_node.items():
-                if key not in ["__commands", "__end"]:
-                    collect_recursive(child_node, ids_set)
-        
-        collect_recursive(node, command_ids)
-        
-        # Сортируем по usage_count
-        sorted_ids = sorted(
-            command_ids,
-            key=lambda cid: self.commands.get(cid, {}).get("usage_count", 0),
-            reverse=True
-        )
-        
-        return sorted_ids[:limit]
-    
-    def _prepare_command_result(self, command_id: str, prefix: str) -> Dict[str, Any]:
-        """Подготавливает данные команды для возврата."""
-        cmd_data = self.commands[command_id].copy()
-        cmd_text = cmd_data.get("command", "")
-        
-        # Вычисляем score релевантности
-        prefix_length = len(prefix)
-        cmd_length = len(cmd_text)
-        
-        if cmd_length > 0:
-            prefix_match_score = prefix_length / cmd_length
-        else:
-            prefix_match_score = 0
-        
-        usage_score = min(1.0, cmd_data.get("usage_count", 0) / 1000)
-        
-        # Взвешенный score
-        cmd_data["score"] = 0.7 * prefix_match_score + 0.3 * usage_score
-        cmd_data["prefix_match_score"] = prefix_match_score
-        cmd_data["usage_score"] = usage_score
-        
-        return cmd_data
-    
-    def _fuzzy_prefix_search(self, query: str, threshold: float) -> List[Dict[str, Any]]:
-        """Нечеткий поиск по префиксу."""
-        results = []
-        
-        # Пробуем разные варианты префикса
-        for prefix_length in range(max(1, len(query) - 2), len(query) + 1):
-            prefix = query[:prefix_length]
-            exact_matches = self.search_exact(prefix, limit=10)
-            
-            for match in exact_matches:
-                cmd_text = match.get("command", "").lower()
-                similarity = self._calculate_similarity(query, cmd_text)
-                
-                if similarity >= threshold:
-                    match["similarity"] = similarity
-                    match["search_method"] = "fuzzy_prefix"
-                    results.append(match)
-        
+        # Сортировка по убыванию оценки
+        results.sort(key=lambda x: x[1], reverse=True)
         return results
     
-    def _ngram_search(self, query: str, threshold: float) -> List[Dict[str, Any]]:
-        """Поиск по n-граммам."""
-        # Заглушка для реальной реализации n-gram поиска
-        # В реальной системе здесь была бы сложная логика
-        return []
-    
-    def _token_search(self, query: str, threshold: float) -> List[Dict[str, Any]]:
-        """Поиск по совпадению токенов."""
-        results = []
-        query_tokens = set(query.split())
+    def _calculate_similarity_score(self, command: Command, 
+                                   prefix_words: List[str], 
+                                   full_prefix: str) -> float:
+        """
+        Вычисление оценки схожести команды с запросом
         
-        for cmd_id, cmd_data in self.commands.items():
-            cmd_text = cmd_data.get("command", "").lower()
-            cmd_tokens = set(cmd_text.split())
+        Args:
+            command: Команда для сравнения
+            prefix_words: Разбитый на слова запрос
+            full_prefix: Полный запрос
             
-            if not query_tokens or not cmd_tokens:
-                continue
-            
-            # Вычисляем меру Жаккара
-            intersection = len(query_tokens & cmd_tokens)
-            union = len(query_tokens | cmd_tokens)
-            
-            if union > 0:
-                jaccard_similarity = intersection / union
-                
-                if jaccard_similarity >= threshold:
-                    cmd_copy = cmd_data.copy()
-                    cmd_copy["similarity"] = jaccard_similarity
-                    cmd_copy["search_method"] = "token"
-                    cmd_copy["common_tokens"] = list(query_tokens & cmd_tokens)
-                    results.append(cmd_copy)
-        
-        return results
-    
-    def _calculate_similarity(self, str1: str, str2: str) -> float:
-        """Вычисляет похожесть между двумя строками."""
-        if not str1 or not str2:
+        Returns:
+            Оценка схожести от 0 до 1
+        """
+        if not prefix_words:
             return 0.0
         
-        # Простая реализация на основе расстояния Левенштейна
-        # В реальной системе можно использовать более сложные алгоритмы
-        from difflib import SequenceMatcher
-        return SequenceMatcher(None, str1, str2).ratio()
+        # 1. Проверка по токенам
+        token_scores = []
+        for token in command.tokens:
+            token_lower = token.lower()
+            # Проверяем начало токена
+            for word in prefix_words:
+                if token_lower.startswith(word):
+                    token_scores.append(len(word) / len(token_lower) if token_lower else 0)
+                    break
+            else:
+                # Проверяем частичное вхождение
+                for word in prefix_words:
+                    if word in token_lower:
+                        token_scores.append(len(word) / len(token_lower))
+                        break
+        
+        # 2. Проверка по тегам
+        tag_scores = []
+        for tag in command.tags:
+            tag_lower = tag.lower()
+            for word in prefix_words:
+                if word in tag_lower:
+                    tag_scores.append(len(word) / len(tag_lower) if tag_lower else 0)
+                    break
+        
+        # 3. Проверка по названию команды
+        name_score = 0.0
+        name_lower = command.name.lower()
+        for word in prefix_words:
+            if word in name_lower:
+                name_score = max(name_score, len(word) / len(name_lower) if name_lower else 0)
+        
+        # 4. Комбинируем оценки
+        scores = []
+        if token_scores:
+            scores.append(sum(token_scores) / len(token_scores))
+        if tag_scores:
+            scores.append(sum(tag_scores) / len(tag_scores))
+        if name_score > 0:
+            scores.append(name_score)
+        
+        # Если нет совпадений, проверяем полный префикс
+        if not scores:
+            full_prefix_lower = full_prefix.lower()
+            for token in command.tokens + command.tags + [command.name]:
+                if full_prefix_lower in token.lower():
+                    return len(full_prefix_lower) / len(token) if token else 0
+        
+        return max(scores) if scores else 0.0
     
-    def _deduplicate_similar_results(self, results: List[Dict]) -> List[Dict]:
-        """Удаляет дубликаты из результатов похожего поиска."""
-        seen = set()
-        unique = []
+    def search_by_tags(self, tags: List[str], require_all: bool = True) -> List[Command]:
+        """
+        Поиск команд по тегам
         
-        for result in results:
-            cmd_id = result.get("id")
-            if cmd_id and cmd_id not in seen:
-                seen.add(cmd_id)
-                unique.append(result)
-        
-        return unique
-    
-    def _add_ngrams(self, command_id: str, text: str, n: int = 3):
-        """Добавляет n-граммы для команды."""
-        # Заглушка для реальной реализации
-        pass
-    
-    def _remove_ngrams(self, command_id: str, text: str):
-        """Удаляет n-граммы для команды."""
-        # Заглушка для реальной реализации
-        pass
-    
-    def _evict_old_commands(self):
-        """Удаляет старые редко используемые команды."""
-        if len(self.commands) <= self.config["max_commands"]:
-            return
-        
-        # Сортируем команды по usage_count и последнему использованию
-        sorted_commands = sorted(
-            self.commands.items(),
-            key=lambda x: (
-                x[1].get("usage_count", 0),
-                x[1].get("last_used", "1970-01-01")
-            )
-        )
-        
-        # Удаляем самые старые и редко используемые
-        to_remove = sorted_commands[:len(self.commands) - self.config["max_commands"]]
-        
-        for cmd_id, _ in to_remove:
-            self.delete_command(cmd_id)
-    
-    def _count_unique_prefixes(self) -> int:
-        """Считает количество уникальных префиксов в Trie."""
-        prefixes = set()
-        
-        def count_recursive(node, current_prefix=""):
-            if "__commands" in node and node["__commands"]:
-                prefixes.add(current_prefix)
+        Args:
+            tags: Список тегов для поиска
+            require_all: Если True, команда должна содержать все теги
             
-            for char, child_node in node.items():
-                if char not in ["__commands", "__end"]:
-                    count_recursive(child_node, current_prefix + char)
+        Returns:
+            Список команд, соответствующих тегам
+        """
+        if not tags:
+            return []
         
-        count_recursive(self.trie)
-        return len(prefixes)
-    
-    def _estimate_memory_usage(self) -> float:
-        """Оценивает использование памяти в мегабайтах."""
-        import sys
-        
-        total_size = 0
-        
-        # Оцениваем размер Trie
-        def estimate_node_size(node):
-            size = sys.getsizeof(node)
-            for key, value in node.items():
-                size += sys.getsizeof(key)
-                if isinstance(value, dict):
-                    size += estimate_node_size(value)
+        if require_all:
+            # Команда должна содержать все теги
+            command_sets = []
+            for tag in tags:
+                if tag in self.tag_to_commands:
+                    command_sets.append(self.tag_to_commands[tag])
                 else:
-                    size += sys.getsizeof(value)
-            return size
-        
-        total_size += estimate_node_size(self.trie)
-        
-        # Оцениваем размер commands
-        for cmd_id, cmd_data in self.commands.items():
-            total_size += sys.getsizeof(cmd_id) + sys.getsizeof(cmd_data)
-        
-        # Оцениваем размер reverse_index
-        for text, ids in self.reverse_index.items():
-            total_size += sys.getsizeof(text) + sys.getsizeof(ids)
-        
-        # Конвертируем в мегабайты
-        return total_size / (1024 * 1024)
-    
-    def _get_top_commands(self, n: int) -> List[Dict[str, Any]]:
-        """Возвращает топ-N самых популярных команд."""
-        sorted_commands = sorted(
-            self.commands.values(),
-            key=lambda x: x.get("usage_count", 0),
-            reverse=True
-        )
-        
-        top = []
-        for cmd in sorted_commands[:n]:
-            top.append({
-                "command": cmd.get("command", ""),
-                "usage_count": cmd.get("usage_count", 0),
-                "last_used": cmd.get("last_used", ""),
-                "category": cmd.get("category", "")
-            })
-        
-        return top
-    
-    def _clear_cache_for_prefix(self, prefix: str):
-        """Очищает кэш для префикса и похожих ключей."""
-        keys_to_remove = []
-        for key in self.prefix_cache.keys():
-            if key.startswith(f"exact_{prefix}") or key.startswith(f"similar_{prefix}"):
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self.prefix_cache[key]
-        
-        # Также очищаем similarity_cache
-        keys_to_remove = []
-        for key in self.similarity_cache.keys():
-            if key.startswith(f"similar_{prefix}"):
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self.similarity_cache[key]
-    
-    def _clear_all_caches(self):
-        """Очищает все кэши."""
-        self.prefix_cache.clear()
-        self.similarity_cache.clear()
-    
-    def _compress_trie(self):
-        """Сжимает Trie, удаляя пустые узлы."""
-        def compress_recursive(node):
-            if not isinstance(node, dict):
-                return node
+                    return []
             
-            # Рекурсивно сжимаем детей
-            for key in list(node.keys()):
-                if key not in ["__commands", "__end"]:
-                    node[key] = compress_recursive(node[key])
-                    # Если узел стал пустым, удаляем его
-                    if not node[key]:
-                        del node[key]
+            if not command_sets:
+                return []
             
-            return node
-        
-        self.trie = compress_recursive(self.trie)
-    
-    def _rebuild_reverse_index(self):
-        """Перестраивает обратный индекс."""
-        self.reverse_index.clear()
-        
-        for cmd_id, cmd_data in self.commands.items():
-            cmd_text = cmd_data.get("command", "")
-            normalized = self._normalize_command_text(cmd_text)
-            
-            if normalized not in self.reverse_index:
-                self.reverse_index[normalized] = set()
-            self.reverse_index[normalized].add(cmd_id)
-    
-    def _count_trie_nodes(self) -> int:
-        """Считает количество узлов в Trie."""
-        def count_recursive(node):
-            count = 1  # Текущий узел
-            for key, child in node.items():
-                if key not in ["__commands", "__end"] and isinstance(child, dict):
-                    count += count_recursive(child)
-            return count
-        
-        return count_recursive(self.trie) if self.trie else 0
-    
-    def _create_backup(self):
-        """Создает backup текущих данных."""
-        backup_dir = self.data_dir / "backups"
-        backup_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = backup_dir / f"command_trie_backup_{timestamp}.pkl"
-        
-        try:
-            save_data = {
-                'trie': self.trie,
-                'commands': self.commands,
-                'reverse_index': self.reverse_index,
-                'metadata': self.metadata
-            }
-            
-            with open(backup_file, 'wb') as f:
-                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            
-            # Удаляем старые backup (оставляем только 5 последних)
-            backups = sorted(backup_dir.glob("command_trie_backup_*.pkl"))
-            for old_backup in backups[:-5]:
-                old_backup.unlink()
-                
-        except Exception as e:
-            print(f"Warning: Could not create backup: {e}")
-    
-    def _load_from_disk(self) -> bool:
-        """Загружает Trie с диска."""
-        data_file = self.data_dir / "command_trie.pkl"
-        
-        if not data_file.exists():
-            return False
-        
-        try:
-            with open(data_file, 'rb') as f:
-                if self.config["compression"]:
-                    import gzip
-                    with gzip.GzipFile(fileobj=f, mode='rb') as gz_file:
-                        data = pickle.load(gz_file)
-                else:
-                    data = pickle.load(f)
-            
-            self.trie = data.get('trie', {})
-            self.commands = data.get('commands', {})
-            self.reverse_index = data.get('reverse_index', {})
-            self.metadata = data.get('metadata', self.metadata)
-            
-            # Обновляем конфиг если есть в сохраненных данных
-            saved_config = data.get('config')
-            if saved_config:
-                self.config.update(saved_config)
-            
-            self.stats["disk_reads"] += 1
-            
-            print(f"Loaded {len(self.commands)} commands from disk")
-            return True
-            
-        except Exception as e:
-            print(f"Warning: Could not load Trie from disk: {e}")
-            # Создаем новые структуры при ошибке загрузки
-            self.trie = {}
-            self.commands = {}
-            self.reverse_index = {}
-            return False
-    
-    def _schedule_save(self):
-        """Планирует сохранение на диск (реализация отложенного сохранения)."""
-        # В реальной системе здесь была бы асинхронная очередь сохранения
-        # Для простоты сохраняем сразу
-        self.save_to_disk()
-
-
-class PersistentCommandTrie(CommandTrie):
-    """
-    Расширенная версия CommandTrie с улучшенной персистентностью.
-    """
-    
-    def __init__(self, data_dir: str = "data", config: Dict[str, Any] = None):
-        super().__init__(data_dir, config)
-        
-        # Дополнительные настройки для персистентности
-        self.persistence_config = {
-            "auto_save_changes": 100,  # Автосохранение после N изменений
-            "incremental_save": True,
-            "save_queue_size": 1000,
-            "recovery_mode": "auto"
-        }
-        
-        # Отслеживание изменений
-        self.change_count = 0
-        self.unsaved_changes = []
-        
-        # Восстановление при необходимости
-        if self.persistence_config["recovery_mode"] == "auto":
-            self._recover_if_needed()
-    
-    def insert(self, command_data: Dict[str, Any]) -> str:
-        """Переопределенный insert с отслеживанием изменений."""
-        cmd_id = super().insert(command_data)
-        
-        # Отслеживаем изменения для инкрементального сохранения
-        self.change_count += 1
-        self.unsaved_changes.append(("insert", cmd_id, command_data))
-        
-        # Проверяем, нужно ли автосохранение
-        if (self.persistence_config["auto_save_changes"] > 0 and
-            self.change_count >= self.persistence_config["auto_save_changes"]):
-            self._save_incremental()
-            self.change_count = 0
-            self.unsaved_changes.clear()
-        
-        return cmd_id
-    
-    def delete_command(self, command_id: str) -> bool:
-        """Переопределенный delete с отслеживанием изменений."""
-        if command_id not in self.commands:
-            return False
-        
-        # Сохраняем данные для возможного восстановления
-        deleted_data = self.commands[command_id].copy()
-        
-        success = super().delete_command(command_id)
-        
-        if success:
-            self.change_count += 1
-            self.unsaved_changes.append(("delete", command_id, deleted_data))
-        
-        return success
-    
-    def _save_incremental(self):
-        """Инкрементальное сохранение изменений."""
-        if not self.persistence_config["incremental_save"]:
-            self.save_to_disk()
-            return
-        
-        # В реальной системе здесь была бы сложная логика
-        # инкрементального сохранения
-        self.save_to_disk(backup=False)
-    
-    def _recover_if_needed(self):
-        """Восстанавливает данные при необходимости."""
-        # Проверяем наличие файла журнала изменений
-        journal_file = self.data_dir / "changes.journal"
-        
-        if journal_file.exists():
-            print("Found change journal, attempting recovery...")
-            try:
-                self._recover_from_journal(journal_file)
-            except Exception as e:
-                print(f"Recovery failed: {e}")
-                # В случае ошибки используем основной файл
-    
-    def _recover_from_journal(self, journal_file: Path):
-        """Восстанавливает данные из журнала изменений."""
-        # Заглушка для реальной реализации
-        pass
-
-
-# Утилитарные функции
-def create_trie_from_commands(commands: List[str],
-                             data_dir: str = "data") -> CommandTrie:
-    """
-    Создает CommandTrie из списка команд.
-    
-    Args:
-        commands: Список текстов команд
-        data_dir: Директория для данных
-    
-    Returns:
-        Инициализированный CommandTrie
-    """
-    trie = CommandTrie(data_dir)
-    
-    for cmd_text in commands:
-        trie.insert({
-            "command": cmd_text,
-            "usage_count": 1,
-            "created_at": datetime.now().isoformat()
-        })
-    
-    return trie
-
-
-def merge_tries(trie1: CommandTrie, trie2: CommandTrie) -> CommandTrie:
-    """
-    Объединяет два CommandTrie в один.
-    
-    Args:
-        trie1: Первый Trie
-        trie2: Второй Trie
-    
-    Returns:
-        Новый объединенный CommandTrie
-    """
-    # Создаем новый Trie
-    merged = CommandTrie()
-    
-    # Добавляем команды из первого Trie
-    for cmd_id, cmd_data in trie1.commands.items():
-        merged.insert(cmd_data.copy())
-    
-    # Добавляем команды из второго Trie
-    for cmd_id, cmd_data in trie2.commands.items():
-        # Обновляем usage_count для существующих команд
-        existing = merged.get_command_by_text(cmd_data.get("command", ""))
-        if existing:
-            merged.update_usage(existing["id"], cmd_data.get("usage_count", 1))
+            common_commands = set.intersection(*command_sets)
+            return [self.commands[cid] for cid in common_commands]
         else:
-            merged.insert(cmd_data.copy())
+            # Команда должна содержать хотя бы один тег
+            found_commands = set()
+            for tag in tags:
+                if tag in self.tag_to_commands:
+                    found_commands.update(self.tag_to_commands[tag])
+            
+            return [self.commands[cid] for cid in found_commands]
     
-    return merged
+    def get_all_commands(self) -> List[Command]:
+        """Получение всех команд"""
+        return list(self.commands.values())
+    
+    def clear(self) -> None:
+        """Очистка всех данных"""
+        self.root = TrieNode()
+        self.commands.clear()
+        self.token_to_commands.clear()
+        self.tag_to_commands.clear()
+
+
+class TrieStorage:
+    """Главный класс для работы с хранилищем команд"""
+    
+    def __init__(self, db_path: Optional[str] = None):
+        """
+        Инициализация хранилища
+        
+        Args:
+            db_path: Путь к SQLite базе данных (опционально)
+        """
+        self.trie = CommandTrie()
+        self.db_path = db_path
+        self.loaded = False
+    
+    def load_from_json(self, json_path: Union[str, Path]) -> None:
+        """
+        Загрузка команд из JSON файла
+        
+        Args:
+            json_path: Путь к JSON файлу
+        """
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"JSON file not found: {json_path}")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        self._load_commands(data)
+        self.loaded = True
+    
+    def load_from_sqlite(self, db_path: Optional[str] = None) -> None:
+        """
+        Загрузка команд из SQLite базы данных
+        
+        Args:
+            db_path: Путь к SQLite базе данных (если None, используется self.db_path)
+        """
+        db_path = db_path or self.db_path
+        if not db_path:
+            raise ValueError("Database path not specified")
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Проверяем существование таблицы
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='commands'
+            """)
+            if not cursor.fetchone():
+                # Создаем таблицу, если её нет
+                cursor.execute("""
+                    CREATE TABLE commands (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        description TEXT,
+                        tokens TEXT,
+                        tags TEXT,
+                        metadata TEXT
+                    )
+                """)
+                conn.commit()
+                return
+            
+            # Загружаем команды
+            cursor.execute("SELECT name, description, tokens, tags, metadata FROM commands")
+            rows = cursor.fetchall()
+            
+            commands_data = []
+            for row in rows:
+                name, description, tokens_str, tags_str, metadata_str = row
+                
+                # Парсим токены и теги
+                tokens = json.loads(tokens_str) if tokens_str else []
+                tags = json.loads(tags_str) if tags_str else []
+                metadata = json.loads(metadata_str) if metadata_str else {}
+                
+                commands_data.append({
+                    'name': name,
+                    'description': description,
+                    'tokens': tokens,
+                    'tags': tags,
+                    'metadata': metadata
+                })
+            
+            self._load_commands(commands_data)
+            self.loaded = True
+            
+        finally:
+            conn.close()
+    
+    def _load_commands(self, commands_data: List[Dict[str, Any]]) -> None:
+        """
+        Загрузка команд из данных
+        
+        Args:
+            commands_data: Список словарей с данными команд
+        """
+        self.trie.clear()
+        
+        for cmd_data in commands_data:
+            command = Command.from_dict(cmd_data)
+            self.trie.insert(command)
+    
+    def save_to_sqlite(self, db_path: Optional[str] = None) -> None:
+        """
+        Сохранение команд в SQLite базу данных
+        
+        Args:
+            db_path: Путь к SQLite базе данных (если None, используется self.db_path)
+        """
+        db_path = db_path or self.db_path
+        if not db_path:
+            raise ValueError("Database path not specified")
+        
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Создаем таблицу, если её нет
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    tokens TEXT,
+                    tags TEXT,
+                    metadata TEXT
+                )
+            """)
+            
+            # Очищаем таблицу
+            cursor.execute("DELETE FROM commands")
+            
+            # Сохраняем команды
+            for command in self.trie.get_all_commands():
+                cursor.execute("""
+                    INSERT INTO commands (name, description, tokens, tags, metadata)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    command.name,
+                    command.description,
+                    json.dumps(command.tokens, ensure_ascii=False),
+                    json.dumps(command.tags, ensure_ascii=False),
+                    json.dumps(command.metadata, ensure_ascii=False)
+                ))
+            
+            conn.commit()
+            
+        finally:
+            conn.close()
+    
+    def save_to_json(self, json_path: Union[str, Path]) -> None:
+        """
+        Сохранение команд в JSON файл
+        
+        Args:
+            json_path: Путь к JSON файлу
+        """
+        json_path = Path(json_path)
+        
+        commands_data = []
+        for command in self.trie.get_all_commands():
+            commands_data.append(command.to_dict())
+        
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(commands_data, f, ensure_ascii=False, indent=2)
+    
+    def add_command(self, name: str, description: str = "", 
+                   tokens: List[str] = None, tags: List[str] = None, 
+                   metadata: Dict[str, Any] = None) -> Command:
+        """
+        Добавление новой команды
+        
+        Args:
+            name: Название команды
+            description: Описание команды
+            tokens: Токены команды
+            tags: Теги команды
+            metadata: Дополнительные метаданные
+            
+        Returns:
+            Созданная команда
+        """
+        command = Command(
+            name=name,
+            description=description,
+            tokens=tokens or [],
+            tags=tags or [],
+            metadata=metadata or {}
+        )
+        self.trie.insert(command)
+        return command
+    
+    def remove_command(self, name: str) -> bool:
+        """
+        Удаление команды по имени
+        
+        Args:
+            name: Название команды
+            
+        Returns:
+            True если команда была удалена, False если команда не найдена
+        """
+        if name not in self.trie.commands:
+            return False
+        
+        # Получаем команду для получения её токенов и тегов
+        command = self.trie.commands[name]
+        
+        # Удаляем из индексов
+        for token in command.tokens:
+            if token in self.trie.token_to_commands:
+                self.trie.token_to_commands[token].discard(name)
+                if not self.trie.token_to_commands[token]:
+                    del self.trie.token_to_commands[token]
+        
+        for tag in command.tags:
+            if tag in self.trie.tag_to_commands:
+                self.trie.tag_to_commands[tag].discard(name)
+                if not self.trie.tag_to_commands[tag]:
+                    del self.trie.tag_to_commands[tag]
+        
+        # Удаляем из Trie
+        # Для простоты перестраиваем Trie без этой команды
+        # В реальной реализации нужно более эффективное удаление
+        commands = list(self.trie.commands.values())
+        self.trie.clear()
+        for cmd in commands:
+            if cmd.name != name:
+                self.trie.insert(cmd)
+        
+        return True
+    
+    def search(self, query: str, search_type: str = "partial", 
+               threshold: float = 0.3) -> List[Tuple[Command, float]]:
+        """
+        Универсальный поиск команд
+        
+        Args:
+            query: Поисковый запрос
+            search_type: Тип поиска ("exact", "partial", "tokens", "tags")
+            threshold: Порог схожести (для partial поиска)
+            
+        Returns:
+            Список кортежей (команда, оценка_схожести)
+        """
+        if not self.loaded:
+            raise RuntimeError("Storage not loaded. Call load_from_json() or load_from_sqlite() first.")
+        
+        query = query.strip()
+        if not query:
+            return [(cmd, 1.0) for cmd in self.trie.get_all_commands()]
+        
+        if search_type == "exact":
+            commands = self.trie.search_exact(query)
+            return [(cmd, 1.0) for cmd in commands]
+        
+        elif search_type == "tokens":
+            tokens = query.split()
+            commands = self.trie.search_by_tokens(tokens)
+            return [(cmd, 1.0) for cmd in commands]
+        
+        elif search_type == "tags":
+            tags = [tag.strip() for tag in query.split(",")]
+            commands = self.trie.search_by_tags(tags, require_all=False)
+            return [(cmd, 1.0) for cmd in commands]
+        
+        else:  # partial
+            return self.trie.search_partial(query, threshold)
+    
+    def get_command(self, name: str) -> Optional[Command]:
+        """Получение команды по имени"""
+        return self.trie.commands.get(name)
+    
+    def command_exists(self, name: str) -> bool:
+        """Проверка существования команды"""
+        return name in self.trie.commands
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Получение статистики хранилища"""
+        return {
+            'total_commands': len(self.trie.commands),
+            'total_tokens': len(self.trie.token_to_commands),
+            'total_tags': len(self.trie.tag_to_commands),
+            'loaded': self.loaded
+        }
+
+
+# Создание глобального экземпляра хранилища для удобства
+_storage_instance: Optional[TrieStorage] = None
+
+
+def get_storage(db_path: Optional[str] = None) -> TrieStorage:
+    """
+    Получение глобального экземпляра хранилища
+    
+    Args:
+        db_path: Путь к SQLite базе данных (опционально)
+        
+    Returns:
+        Экземпляр TrieStorage
+    """
+    global _storage_instance
+    if _storage_instance is None:
+        _storage_instance = TrieStorage(db_path)
+    return _storage_instance
+
+
+def load_default_storage(json_path: Optional[Union[str, Path]] = None, 
+                        db_path: Optional[str] = None) -> TrieStorage:
+    """
+    Загрузка хранилища по умолчанию
+    
+    Args:
+        json_path: Путь к JSON файлу (приоритет)
+        db_path: Путь к SQLite базе данных
+        
+    Returns:
+        Загруженный экземпляр TrieStorage
+    """
+    storage = get_storage(db_path)
+    
+    if json_path and Path(json_path).exists():
+        storage.load_from_json(json_path)
+    elif db_path:
+        storage.load_from_sqlite(db_path)
+    
+    return storage
