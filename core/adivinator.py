@@ -1,548 +1,364 @@
 # core/adivinator.py
 """
-Основной модуль для семантического предсказания команд.
-Использует CommandTrie для поиска и ранжирования команд.
+Основной модуль для предсказания команд (адивинации).
+Обеспечивает инкрементальное автодополнение по мере ввода.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import time
 from storage.trie_storage import CommandTrie, Command
 
 
 class AdvinationResultType(Enum):
     """Типы результатов предсказания"""
-    FOUND = "found"            # Точное совпадение
-    PARTIAL_FOUND = "partial"  # Частичное совпадение
-    NO_MATCH = "no_match"      # Совпадений не найдено
-    ERROR = "error"            # Ошибка при обработке
+    EXACT_MATCH = "exact_match"        # Точное совпадение
+    PARTIAL_MATCH = "partial_match"    # Частичное совпадение
+    NO_MATCH = "no_match"              # Совпадений не найдено
+    MULTIPLE_OPTIONS = "multiple"      # Несколько вариантов
+    POPULAR = "popular"                # Популярные команды
 
 
 @dataclass
 class Suggestion:
-    """Предложение команды с оценкой релевантности"""
+    """Предложение команды с информацией для автодополнения"""
     command_name: str
     confidence: float
-    matched_tokens: List[str]
+    matched_part: str = ""  # Какая часть команды совпала
+    completion_text: str = ""  # Текст для автодополнения
     command_description: str = ""
-    matched_tags: Optional[List[str]] = None
-    metadata: Optional[Dict[str, Any]] = None
-    
-    def __post_init__(self):
-        if self.matched_tags is None:
-            self.matched_tags = []
-        if self.metadata is None:
-            self.metadata = {}
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Преобразование в словарь"""
         return {
             'command_name': self.command_name,
             'confidence': self.confidence,
-            'matched_tokens': self.matched_tokens,
+            'matched_part': self.matched_part,
+            'completion_text': self.completion_text,
             'command_description': self.command_description,
-            'matched_tags': self.matched_tags,
             'metadata': self.metadata
         }
-    
-    @classmethod
-    def from_command(cls, command: Command, confidence: float = 1.0, 
-                    matched_tokens: Optional[List[str]] = None) -> 'Suggestion':
-        """Создание предложения из команды"""
-        return cls(
-            command_name=command.name,
-            confidence=confidence,
-            matched_tokens=matched_tokens or command.tokens,
-            command_description=command.description,
-            matched_tags=command.tags,
-            metadata=command.metadata
-        )
 
 
 @dataclass
 class AdvinationResult:
-    """Результат предсказания команд"""
+    """Результат предсказания"""
     result_type: AdvinationResultType
     suggestions: List[Suggestion]
-    confidence: float
     query: str = ""
-    error_message: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    timestamp: float = field(default_factory=time.time)
     
     def to_dict(self) -> Dict[str, Any]:
         """Преобразование в словарь"""
         return {
             'result_type': self.result_type.value,
             'suggestions': [s.to_dict() for s in self.suggestions],
-            'confidence': self.confidence,
             'query': self.query,
-            'error_message': self.error_message,
-            'metadata': self.metadata
+            'timestamp': self.timestamp
         }
-    
-    def is_successful(self) -> bool:
-        """Проверка успешности поиска"""
-        return self.result_type in [AdvinationResultType.FOUND, AdvinationResultType.PARTIAL_FOUND]
     
     def get_best_suggestion(self) -> Optional[Suggestion]:
         """Получение лучшего предложения"""
         if not self.suggestions:
             return None
         return max(self.suggestions, key=lambda x: x.confidence)
-    
-    def get_suggestions_by_threshold(self, threshold: float = 0.3) -> List[Suggestion]:
-        """Получение предложений с доверием выше порога"""
-        return [s for s in self.suggestions if s.confidence >= threshold]
 
 
 class Adivinator:
-    """Основной класс для семантического предсказания команд"""
+    """Класс для предсказания команд по мере ввода"""
     
     def __init__(self, trie: CommandTrie):
-        """
-        Инициализация предсказателя
-        
-        Args:
-            trie: Экземпляр CommandTrie для поиска команд
-        """
         self.trie = trie
-        self.default_threshold = 0.3
-        self.exact_match_boost = 1.0
-        self.partial_match_penalty = 0.7
+        self.cache: Dict[str, AdvinationResult] = {}
+        self.cache_ttl = 5.0  # 5 секунд TTL для кэша
     
-    def set_threshold(self, threshold: float) -> None:
+    def predict(self, query: str, cursor_pos: Optional[int] = None) -> AdvinationResult:
         """
-        Установка порога доверия для частичных совпадений
+        Основной метод предсказания
         
         Args:
-            threshold: Пороговое значение (0-1)
+            query: Текущий ввод пользователя
+            cursor_pos: Позиция курсора (если известна)
+            
+        Returns:
+            AdvinationResult с предсказаниями
         """
-        if 0 <= threshold <= 1:
-            self.default_threshold = threshold
+        # Нормализуем запрос
+        query = query.strip()
+        
+        # Проверяем кэш
+        cache_key = f"{query}_{cursor_pos}"
+        if cache_key in self.cache:
+            cached_result = self.cache[cache_key]
+            if time.time() - cached_result.timestamp < self.cache_ttl:
+                return cached_result
+        
+        # Обрабатываем пустой запрос
+        if not query:
+            result = self._predict_empty()
         else:
-            raise ValueError("Threshold must be between 0 and 1")
-    
-    def advinate(self, prefix: str, threshold: Optional[float] = None, 
-                search_type: str = "auto") -> AdvinationResult:
-        """
-        Основной метод предсказания команд
-        
-        Args:
-            prefix: Входной префикс/запрос для поиска
-            threshold: Порог доверия (если None, используется default_threshold)
-            search_type: Тип поиска ("auto", "exact", "partial", "tokens", "tags")
-            
-        Returns:
-            AdvinationResult с результатами поиска
-        """
-        if threshold is None:
-            threshold = self.default_threshold
-        
-        try:
-            # Нормализация ввода
-            prefix = self._normalize_input(prefix)
-            
-            if not prefix:
-                # Пустой запрос - возвращаем все команды с низким доверием
-                all_commands = self.trie.get_all_commands()
-                suggestions = [
-                    Suggestion.from_command(cmd, confidence=0.1)
-                    for cmd in all_commands[:10]  # Ограничиваем количество
-                ]
-                return AdvinationResult(
-                    result_type=AdvinationResultType.PARTIAL_FOUND,
-                    suggestions=suggestions,
-                    confidence=0.1,
-                    query=prefix
-                )
-            
-            # Определяем тип поиска
-            if search_type == "auto":
-                return self._advinate_auto(prefix, threshold)
-            elif search_type == "exact":
-                return self._advinate_exact(prefix)
-            elif search_type == "partial":
-                return self._advinate_partial(prefix, threshold)
-            elif search_type == "tokens":
-                return self._advinate_by_tokens(prefix)
-            elif search_type == "tags":
-                return self._advinate_by_tags(prefix)
+            # Определяем стратегию предсказания
+            if cursor_pos is None or cursor_pos == len(query):
+                # Курсор в конце - автодополняем последнее слово
+                result = self._predict_autocomplete(query)
             else:
-                raise ValueError(f"Unknown search type: {search_type}")
+                # Курсор где-то посередине - полный поиск
+                result = self._predict_full_search(query)
+        
+        # Сохраняем в кэш
+        result.query = query
+        self.cache[cache_key] = result
+        
+        # Очищаем старый кэш
+        self._clean_cache()
+        
+        return result
+    
+    def _predict_empty(self) -> AdvinationResult:
+        """Предсказание для пустого ввода"""
+        # Получаем популярные команды
+        popular_commands = self.trie.autocomplete("", limit=5)
+        
+        suggestions = []
+        for cmd, score in popular_commands:
+            suggestion = Suggestion(
+                command_name=cmd.name,
+                confidence=score,
+                command_description=cmd.description,
+                metadata={
+                    'usage_count': cmd.usage_count,
+                    'is_popular': True
+                }
+            )
+            suggestions.append(suggestion)
+        
+        return AdvinationResult(
+            result_type=AdvinationResultType.POPULAR,
+            suggestions=suggestions
+        )
+    
+    def _predict_autocomplete(self, query: str) -> AdvinationResult:
+        """Предсказание с автодополнением (курсор в конце)"""
+        # Разбиваем запрос на слова
+        words = query.split()
+        
+        if not words:
+            return self._predict_empty()
+        
+        # Анализируем последнее слово для автодополнения
+        last_word = words[-1]
+        context_words = words[:-1] if len(words) > 1 else []
+        
+        # Получаем варианты автодополнения
+        completions = self.trie.autocomplete(last_word, limit=10)
+        
+        # Фильтруем по контексту, если есть
+        if context_words and completions:
+            completions = self._filter_by_context(completions, context_words)
+        
+        # Создаём предложения
+        suggestions = []
+        for cmd, score in completions:
+            # Определяем, какая часть команды совпала
+            matched_part, completion_text = self._find_completion(cmd.name, last_word)
+            
+            suggestion = Suggestion(
+                command_name=cmd.name,
+                confidence=score,
+                matched_part=matched_part,
+                completion_text=completion_text,
+                command_description=cmd.description,
+                metadata={
+                    'is_exact_match': cmd.name.lower().startswith(last_word.lower()),
+                    'usage_count': cmd.usage_count
+                }
+            )
+            suggestions.append(suggestion)
+        
+        # Определяем тип результата
+        if not suggestions:
+            result_type = AdvinationResultType.NO_MATCH
+        elif len(suggestions) == 1 and suggestions[0].metadata.get('is_exact_match'):
+            result_type = AdvinationResultType.EXACT_MATCH
+        elif len(suggestions) <= 3:
+            result_type = AdvinationResultType.PARTIAL_MATCH
+        else:
+            result_type = AdvinationResultType.MULTIPLE_OPTIONS
+        
+        return AdvinationResult(
+            result_type=result_type,
+            suggestions=suggestions
+        )
+    
+    def _predict_full_search(self, query: str) -> AdvinationResult:
+        """Полнотекстовый поиск (курсор не в конце)"""
+        # Используем семантический поиск
+        semantic_results = self.trie.search_semantic(query, limit=10)
+        
+        suggestions = []
+        for cmd, score in semantic_results:
+            # Находим совпадающие части
+            matched_parts = self._find_matches(cmd, query)
+            
+            suggestion = Suggestion(
+                command_name=cmd.name,
+                confidence=score,
+                matched_part=", ".join(matched_parts),
+                completion_text="",  # Нет автодополнения при курсоре не в конце
+                command_description=cmd.description,
+                metadata={
+                    'matched_parts': matched_parts,
+                    'is_semantic_match': True
+                }
+            )
+            suggestions.append(suggestion)
+        
+        result_type = AdvinationResultType.PARTIAL_MATCH if suggestions else AdvinationResultType.NO_MATCH
+        
+        return AdvinationResult(
+            result_type=result_type,
+            suggestions=suggestions
+        )
+    
+    def _filter_by_context(self, completions: List[Tuple[Command, float]], 
+                          context_words: List[str]) -> List[Tuple[Command, float]]:
+        """Фильтрация вариантов по контексту"""
+        filtered = []
+        
+        for cmd, score in completions:
+            # Проверяем, содержат ли токены команды контекстные слова
+            context_match = True
+            
+            for word in context_words:
+                word_lower = word.lower()
                 
-        except Exception as e:
-            return AdvinationResult(
-                result_type=AdvinationResultType.ERROR,
-                suggestions=[],
-                confidence=0.0,
-                query=prefix,
-                error_message=str(e)
-            )
+                # Проверяем в имени команды
+                if word_lower in cmd.name.lower():
+                    continue
+                
+                # Проверяем в токенах
+                found_in_tokens = False
+                for token in cmd.tokens:
+                    if word_lower in token.lower():
+                        found_in_tokens = True
+                        break
+                
+                if found_in_tokens:
+                    continue
+                
+                # Проверяем в тегах
+                found_in_tags = False
+                for tag in cmd.tags:
+                    if word_lower in tag.lower():
+                        found_in_tags = True
+                        break
+                
+                if not found_in_tags:
+                    context_match = False
+                    break
+            
+            if context_match:
+                # Увеличиваем оценку за совпадение контекста
+                filtered.append((cmd, min(1.0, score * 1.2)))
+            else:
+                # Уменьшаем оценку за несовпадение контекста
+                filtered.append((cmd, score * 0.5))
+        
+        return filtered
     
-    def _normalize_input(self, input_str: str) -> str:
-        """
-        Нормализация входной строки
-        
-        Args:
-            input_str: Входная строка
+    def _find_completion(self, command_name: str, prefix: str) -> Tuple[str, str]:
+        """Нахождение совпадающей части и текста для автодополнения"""
+        if command_name.lower().startswith(prefix.lower()):
+            matched = prefix
+            completion = command_name[len(prefix):]
+        else:
+            # Ищем совпадение в токенах
+            matched = ""
+            completion = ""
             
-        Returns:
-            Нормализованная строка
-        """
-        # Приводим к нижнему регистру и убираем лишние пробелы
-        normalized = input_str.lower().strip()
-        
-        # Заменяем множественные пробелы на одиночные
-        while '  ' in normalized:
-            normalized = normalized.replace('  ', ' ')
-        
-        return normalized
-    
-    def _advinate_auto(self, prefix: str, threshold: float) -> AdvinationResult:
-        """
-        Автоматический поиск с определением оптимальной стратегии
-        
-        Args:
-            prefix: Поисковый запрос
-            threshold: Порог доверия
+            # Разбиваем команду на части (по CamelCase, дефисам, подчёркиваниям)
+            parts = []
+            current_part = ""
             
-        Returns:
-            AdvinationResult
-        """
-        # 1. Пробуем точный поиск по токенам
-        token_results = self.trie.search_by_tokens(prefix.split())
-        if token_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=1.0 * self.exact_match_boost)
-                for cmd in token_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.FOUND,
-                suggestions=suggestions,
-                confidence=1.0,
-                query=prefix
-            )
-        
-        # 2. Пробуем точный поиск по префиксу
-        exact_results = self.trie.search_exact(prefix)
-        if exact_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=1.0)
-                for cmd in exact_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.FOUND,
-                suggestions=suggestions,
-                confidence=1.0,
-                query=prefix
-            )
-        
-        # 3. Пробуем частичный поиск
-        partial_results = self.trie.search_partial(prefix, threshold)
-        if partial_results:
-            suggestions = []
-            for cmd, score in partial_results:
-                # Находим совпавшие токены
-                matched_tokens = self._find_matched_tokens(cmd, prefix)
-                suggestion = Suggestion.from_command(
-                    cmd, 
-                    confidence=score,
-                    matched_tokens=matched_tokens
-                )
-                suggestions.append(suggestion)
+            for char in command_name:
+                if char.isupper() and current_part:
+                    parts.append(current_part)
+                    current_part = char
+                elif char in ['-', '_']:
+                    if current_part:
+                        parts.append(current_part)
+                        current_part = ""
+                else:
+                    current_part += char
             
-            max_confidence = max(suggestion.confidence for suggestion in suggestions)
-            return AdvinationResult(
-                result_type=AdvinationResultType.PARTIAL_FOUND,
-                suggestions=suggestions,
-                confidence=max_confidence,
-                query=prefix
-            )
-        
-        # 4. Пробуем поиск по тегам
-        tag_results = self.trie.search_by_tags(prefix.split(), require_all=False)
-        if tag_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=0.5)
-                for cmd in tag_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.PARTIAL_FOUND,
-                suggestions=suggestions,
-                confidence=0.5,
-                query=prefix
-            )
-        
-        # 5. Ничего не найдено
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            suggestions=[],
-            confidence=0.0,
-            query=prefix
-        )
-    
-    def _advinate_exact(self, prefix: str) -> AdvinationResult:
-        """
-        Точный поиск команд
-        
-        Args:
-            prefix: Поисковый запрос
+            if current_part:
+                parts.append(current_part)
             
-        Returns:
-            AdvinationResult
-        """
-        # Ищем точные совпадения
-        exact_results = self.trie.search_exact(prefix)
-        
-        if exact_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=1.0)
-                for cmd in exact_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.FOUND,
-                suggestions=suggestions,
-                confidence=1.0,
-                query=prefix
-            )
-        
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            suggestions=[],
-            confidence=0.0,
-            query=prefix
-        )
-    
-    def _advinate_partial(self, prefix: str, threshold: float) -> AdvinationResult:
-        """
-        Частичный поиск команд
-        
-        Args:
-            prefix: Поисковый запрос
-            threshold: Порог доверия
-            
-        Returns:
-            AdvinationResult
-        """
-        # Ищем частичные совпадения
-        partial_results = self.trie.search_partial(prefix, threshold)
-        
-        if partial_results:
-            suggestions = []
-            for cmd, score in partial_results:
-                # Находим совпавшие токены
-                matched_tokens = self._find_matched_tokens(cmd, prefix)
-                suggestion = Suggestion.from_command(
-                    cmd, 
-                    confidence=score,
-                    matched_tokens=matched_tokens
-                )
-                suggestions.append(suggestion)
-            
-            max_confidence = max(suggestion.confidence for suggestion in suggestions)
-            return AdvinationResult(
-                result_type=AdvinationResultType.PARTIAL_FOUND,
-                suggestions=suggestions,
-                confidence=max_confidence,
-                query=prefix
-            )
-        
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            suggestions=[],
-            confidence=0.0,
-            query=prefix
-        )
-    
-    def _advinate_by_tokens(self, prefix: str) -> AdvinationResult:
-        """
-        Поиск по токенам
-        
-        Args:
-            prefix: Поисковый запрос
-            
-        Returns:
-            AdvinationResult
-        """
-        tokens = prefix.split()
-        token_results = self.trie.search_by_tokens(tokens)
-        
-        if token_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=1.0)
-                for cmd in token_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.FOUND,
-                suggestions=suggestions,
-                confidence=1.0,
-                query=prefix
-            )
-        
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            suggestions=[],
-            confidence=0.0,
-            query=prefix
-        )
-    
-    def _advinate_by_tags(self, prefix: str) -> AdvinationResult:
-        """
-        Поиск по тегам
-        
-        Args:
-            prefix: Поисковый запрос
-            
-        Returns:
-            AdvinationResult
-        """
-        tags = [tag.strip() for tag in prefix.split(",")]
-        tag_results = self.trie.search_by_tags(tags, require_all=False)
-        
-        if tag_results:
-            suggestions = [
-                Suggestion.from_command(cmd, confidence=0.7)
-                for cmd in tag_results
-            ]
-            return AdvinationResult(
-                result_type=AdvinationResultType.PARTIAL_FOUND,
-                suggestions=suggestions,
-                confidence=0.7,
-                query=prefix
-            )
-        
-        return AdvinationResult(
-            result_type=AdvinationResultType.NO_MATCH,
-            suggestions=[],
-            confidence=0.0,
-            query=prefix
-        )
-    
-    def _find_matched_tokens(self, command: Command, query: str) -> List[str]:
-        """
-        Поиск совпавших токенов в команде
-        
-        Args:
-            command: Команда для проверки
-            query: Поисковый запрос
-            
-        Returns:
-            Список совпавших токенов
-        """
-        matched_tokens = []
-        query_lower = query.lower()
-        
-        for token in command.tokens:
-            token_lower = token.lower()
-            # Проверяем разные варианты совпадения
-            if query_lower in token_lower:
-                matched_tokens.append(token)
-            elif token_lower in query_lower:
-                matched_tokens.append(token)
-            elif any(word in token_lower for word in query_lower.split()):
-                matched_tokens.append(token)
-        
-        return matched_tokens
-    
-    def batch_advinate(self, queries: List[str], threshold: Optional[float] = None) -> List[AdvinationResult]:
-        """
-        Пакетное предсказание для нескольких запросов
-        
-        Args:
-            queries: Список запросов
-            threshold: Порог доверия
-            
-        Returns:
-            Список AdvinationResult
-        """
-        return [self.advinate(query, threshold) for query in queries]
-    
-    def get_all_suggestions(self, min_confidence: float = 0.1) -> List[Suggestion]:
-        """
-        Получение всех команд как предложений
-        
-        Args:
-            min_confidence: Минимальное доверие
-            
-        Returns:
-            Список предложений
-        """
-        all_commands = self.trie.get_all_commands()
-        suggestions = [
-            Suggestion.from_command(cmd, confidence=min_confidence)
-            for cmd in all_commands
-        ]
-        return suggestions
-    
-    def analyze_query(self, query: str) -> Dict[str, Any]:
-        """
-        Анализ запроса без выполнения поиска
-        
-        Args:
-            query: Запрос для анализа
-            
-        Returns:
-            Словарь с метаданными анализа
-        """
-        normalized = self._normalize_input(query)
-        words = normalized.split()
-        
-        analysis = {
-            'original_query': query,
-            'normalized_query': normalized,
-            'word_count': len(words),
-            'words': words,
-            'is_empty': not normalized,
-            'potential_tokens': [],
-            'potential_tags': []
-        }
-        
-        # Проверяем, могут ли слова быть токенами
-        for word in words:
-            # Простая эвристика: если слово есть в токенах каких-либо команд
-            for token in self.trie.token_to_commands.keys():
-                if word in token.lower():
-                    analysis['potential_tokens'].append(word)
+            # Ищем совпадение с префиксом
+            for part in parts:
+                if part.lower().startswith(prefix.lower()):
+                    matched = prefix
+                    completion = command_name[command_name.index(part) + len(prefix):]
                     break
         
-        return analysis
-
-
-# Фабричная функция для создания Adivinator
-def create_adivinator(trie: Optional[CommandTrie] = None) -> Adivinator:
-    """
-    Создание экземпляра Adivinator
+        return matched, completion
     
-    Args:
-        trie: Экземпляр CommandTrie (если None, создается пустой)
+    def _find_matches(self, command: Command, query: str) -> List[str]:
+        """Поиск совпадающих частей команды с запросом"""
+        matches = []
+        query_lower = query.lower()
         
-    Returns:
-        Экземпляр Adivinator
-    """
+        # Проверяем имя команды
+        if query_lower in command.name.lower():
+            matches.append(f"name: {command.name}")
+        
+        # Проверяем токены
+        for token in command.tokens:
+            if query_lower in token.lower():
+                matches.append(f"token: {token}")
+        
+        # Проверяем теги
+        for tag in command.tags:
+            if query_lower in tag.lower():
+                matches.append(f"tag: {tag}")
+        
+        return matches
+    
+    def _clean_cache(self):
+        """Очистка устаревшего кэша"""
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key, result in self.cache.items():
+            if current_time - result.timestamp > self.cache_ttl:
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            del self.cache[key]
+    
+    def batch_predict(self, queries: List[str]) -> List[AdvinationResult]:
+        """Пакетное предсказание"""
+        return [self.predict(query) for query in queries]
+
+
+# Фабричные функции
+def create_adivinator(trie: Optional[CommandTrie] = None) -> Adivinator:
+    """Создание экземпляра Adivinator"""
+    from storage.trie_storage import CommandTrie as DefaultTrie
+    
     if trie is None:
-        trie = CommandTrie()
+        trie = DefaultTrie()
     return Adivinator(trie)
 
 
-# Глобальный экземпляр для удобства
+# Глобальный экземпляр
 _default_adivinator: Optional[Adivinator] = None
 
-
-def get_default_adivinator(trie: Optional[CommandTrie] = None) -> Adivinator:
-    """
-    Получение глобального экземпляра Adivinator
-    
-    Args:
-        trie: Экземпляр CommandTrie (если None и глобальный не создан, создается новый)
-        
-    Returns:
-        Экземпляр Adivinator
-    """
+def get_default_adivinator() -> Adivinator:
+    """Получение глобального экземпляра Adivinator"""
     global _default_adivinator
     if _default_adivinator is None:
-        _default_adivinator = create_adivinator(trie)
+        _default_adivinator = create_adivinator()
     return _default_adivinator

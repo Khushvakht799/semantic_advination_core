@@ -1,0 +1,51 @@
+[
+  {
+    "timestamp": "2026-01-07T18:23:11.067554",
+    "query": "create user",
+    "outcome": "suggest_exact",
+    "confidence": 1.0,
+    "suggestions_count": 1
+  },
+  {
+    "timestamp": "2026-01-07T18:24:05.985386",
+    "query": "создать юзера",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  },
+  {
+    "timestamp": "2026-01-07T18:25:00.101908",
+    "query": "удалить пользователя",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  },
+  {
+    "timestamp": "2026-01-07T18:25:10.623812",
+    "query": "удалить файл",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  },
+  {
+    "timestamp": "2026-01-07T18:25:34.915979",
+    "query": "создать суперюзера",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  },
+  {
+    "timestamp": "2026-01-07T18:25:44.784000",
+    "query": "показать лог админа",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  },
+  {
+    "timestamp": "2026-01-07T18:27:18.881920",
+    "query": "удалить файл",
+    "outcome": "suggest_fallback",
+    "confidence": 0.1,
+    "suggestions_count": 5
+  }
+]

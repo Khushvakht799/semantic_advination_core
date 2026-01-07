@@ -1,0 +1,23 @@
+[
+  {
+    "name": "deploy-application",
+    "description": "Развернуть приложение",
+    "tokens": ["deploy", "application", "app", "release", "publish"],
+    "tags": ["deployment", "application", "devops"],
+    "metadata": {"environment": "production", "requires_approval": true}
+  },
+  {
+    "name": "backup-database",
+    "description": "Создать резервную копию базы данных",
+    "tokens": ["backup", "database", "db", "save", "export"],
+    "tags": ["database", "backup", "maintenance"],
+    "metadata": {"schedule": "daily", "retention_days": 30}
+  },
+  {
+    "name": "monitor-system",
+    "description": "Мониторинг состояния системы",
+    "tokens": ["monitor", "system", "watch", "check", "status"],
+    "tags": ["monitoring", "system", "performance"],
+    "metadata": {"dashboard": true, "alerts": true}
+  }
+]

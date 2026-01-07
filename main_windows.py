@@ -1,26 +1,25 @@
-# main.py
+# main_windows.py (альтернативная версия для Windows)
 """
-Главный CLI модуль для системы семантического автодополнения команд.
-Реализует поведение, подобное PowerShell и Google поиску.
+Версия для Windows с поддержкой pyreadline3
 """
 
 import sys
 import os
-import argparse
-import json
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-import shlex
 
-# Попытка импорта readline с обработкой ошибки для Windows
+# Попытка использовать pyreadline3 для Windows
 try:
-    import readline  # Для автодополнения в Unix
+    import pyreadline3 as readline
     READLINE_AVAILABLE = True
+    print("Используется pyreadline3 для автодополнения")
 except ImportError:
-    READLINE_AVAILABLE = False
-    print("Внимание: readline недоступен (Windows). Используется упрощённый ввод.")
+    try:
+        import readline
+        READLINE_AVAILABLE = True
+    except ImportError:
+        READLINE_AVAILABLE = False
+        print("Внимание: readline недоступен. Используется упрощённый ввод.")
 
-# Импорт компонентов системы
+# Остальной код такой же как в main.py, начиная с импортов
 from storage.trie_storage import CommandTrie, Command, TrieStorage
 from core.adivinator import Adivinator, create_adivinator
 from core.validator import Validator, Context, create_validator
